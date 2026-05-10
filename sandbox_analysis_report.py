@@ -834,11 +834,37 @@ def log_tick_values(min_exp: float, max_exp: float) -> list[float]:
     return [10 ** exponent for exponent in selected]
 
 
+def timeline_axis_bounds(stats_rows: list[dict[str, object]]) -> tuple[datetime, datetime]:
+    hours = [row.get("hour") for row in stats_rows if isinstance(row.get("hour"), datetime)]
+    if not hours:
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        return now, now + timedelta(hours=1)
+
+    data_start = min(hours)
+    data_end = max(hours)
+    if data_start.date() != data_end.date():
+        axis_start = data_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        axis_start = data_start
+    axis_end = data_end
+    if axis_end <= axis_start:
+        axis_end = axis_start + timedelta(hours=1)
+    return axis_start, axis_end
+
+
+def timeline_x(timestamp: datetime, axis_start: datetime, axis_end: datetime, left: int, right: int) -> float:
+    span_seconds = max(1.0, (axis_end - axis_start).total_seconds())
+    offset_seconds = (timestamp - axis_start).total_seconds()
+    return left + ((right - left) * (offset_seconds / span_seconds))
+
+
 def svg_log_points(
     stats_rows: list[dict[str, object]],
     key: str,
     min_exp: float,
     max_exp: float,
+    axis_start: datetime,
+    axis_end: datetime,
     left: int,
     right: int,
     top: int,
@@ -846,17 +872,16 @@ def svg_log_points(
 ) -> list[tuple[float, float]]:
     if len(stats_rows) < 2 or max_exp <= min_exp:
         return []
-    span_x = right - left
     span_y = bottom - top
-    denominator = max(1, len(stats_rows) - 1)
     points: list[tuple[float, float]] = []
-    for index, row in enumerate(stats_rows):
+    for row in stats_rows:
         value = row.get(key)
-        if not isinstance(value, (float, int)):
+        timestamp = row.get("hour")
+        if not isinstance(value, (float, int)) or not isinstance(timestamp, datetime):
             continue
         numeric_value = max(float(value), 1.0)
         log_value = math.log10(numeric_value)
-        x = left + (span_x * index / denominator)
+        x = timeline_x(timestamp, axis_start, axis_end, left, right)
         y = bottom - (((log_value - min_exp) / (max_exp - min_exp)) * span_y)
         points.append((x, y))
     return points
@@ -869,6 +894,57 @@ def svg_path(points: list[tuple[float, float]]) -> str:
     commands = [f"M {first_x:.1f} {first_y:.1f}"]
     commands.extend(f"L {x:.1f} {y:.1f}" for x, y in points[1:])
     return " ".join(commands)
+
+
+def smooth_svg_path(points: list[tuple[float, float]]) -> str:
+    if len(points) < 3:
+        return svg_path(points)
+
+    commands = [f"M {points[0][0]:.1f} {points[0][1]:.1f}"]
+    for index in range(len(points) - 1):
+        p0 = points[index - 1] if index > 0 else points[index]
+        p1 = points[index]
+        p2 = points[index + 1]
+        p3 = points[index + 2] if index + 2 < len(points) else p2
+        c1x = p1[0] + (p2[0] - p0[0]) / 6
+        c1y = p1[1] + (p2[1] - p0[1]) / 6
+        c2x = p2[0] - (p3[0] - p1[0]) / 6
+        c2y = p2[1] - (p3[1] - p1[1]) / 6
+        commands.append(f"C {c1x:.1f} {c1y:.1f}, {c2x:.1f} {c2y:.1f}, {p2[0]:.1f} {p2[1]:.1f}")
+    return " ".join(commands)
+
+
+def render_timeline_x_ticks(stats_rows: list[dict[str, object]], axis_start: datetime, axis_end: datetime, left: int, right: int, bottom: int) -> str:
+    if not stats_rows:
+        return ""
+
+    hours = [row.get("hour") for row in stats_rows if isinstance(row.get("hour"), datetime)]
+    if not hours:
+        return ""
+
+    ticks: list[tuple[datetime, str]] = []
+    if min(hours).date() != max(hours).date():
+        current = axis_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        while current <= axis_end:
+            ticks.append((current, current.strftime("%m-%d 00:00")))
+            current += timedelta(days=1)
+    else:
+        ticks.append((min(hours), min(hours).strftime("%m-%d %H:%M")))
+        if max(hours) != min(hours):
+            ticks.append((max(hours), max(hours).strftime("%m-%d %H:%M")))
+
+    output: list[str] = []
+    seen_labels: set[str] = set()
+    for timestamp, label in ticks:
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        x = timeline_x(timestamp, axis_start, axis_end, left, right)
+        output.append(
+            f'<line class="chart-tick" x1="{x:.1f}" y1="{bottom}" x2="{x:.1f}" y2="{bottom + 5}"></line>'
+            f'<text class="chart-label x-label" x="{x:.1f}" y="{bottom + 26}" text-anchor="middle">{escape_html(label)}</text>'
+        )
+    return "".join(output)
 
 
 def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
@@ -890,8 +966,9 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
     if not duration_values:
         return '<p class="empty">No sandbox release durations for timeline chart</p>'
     min_exp, max_exp = log_chart_bounds(duration_values)
-    avg_points = svg_log_points(stats_rows, "avg_release", min_exp, max_exp, left, right, top, bottom)
-    p90_points = svg_log_points(stats_rows, "p90_release", min_exp, max_exp, left, right, top, bottom)
+    axis_start, axis_end = timeline_axis_bounds(stats_rows)
+    avg_points = svg_log_points(stats_rows, "avg_release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
+    p90_points = svg_log_points(stats_rows, "p90_release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
 
     duration_ticks = log_tick_values(min_exp, max_exp)
     grid_lines = []
@@ -903,18 +980,7 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
             f'<text class="chart-label axis-label" x="{left - 10}" y="{y + 4:.1f}" text-anchor="end">{escape_html(format_seconds(value))}</text>'
         )
 
-    label_indices: set[int] = {0, len(stats_rows) - 1}
-    if len(stats_rows) > 2:
-        step = max(1, (len(stats_rows) - 1) // 4)
-        label_indices.update(range(0, len(stats_rows), step))
-    x_labels = []
-    for index, row in enumerate(stats_rows):
-        if index not in label_indices:
-            continue
-        x = left + ((right - left) * index / max(1, len(stats_rows) - 1))
-        x_labels.append(
-            f'<text class="chart-label x-label" x="{x:.1f}" y="{bottom + 26}" text-anchor="middle">{escape_html(row.get("short_label"))}</text>'
-        )
+    x_ticks = render_timeline_x_ticks(stats_rows, axis_start, axis_end, left, right, bottom)
 
     avg_circles = "".join(f'<circle class="avg-point" cx="{x:.1f}" cy="{y:.1f}" r="3.4"></circle>' for x, y in avg_points) if len(avg_points) == 1 else ""
     p90_circles = "".join(f'<circle class="p90-point" cx="{x:.1f}" cy="{y:.1f}" r="3.4"></circle>' for x, y in p90_points) if len(p90_points) == 1 else ""
@@ -924,11 +990,11 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
     <rect class="chart-frame" x="{left}" y="{top}" width="{right - left}" height="{bottom - top}"></rect>
     {''.join(grid_lines)}
     <text class="chart-label axis-title" x="{left}" y="18">Release time, log scale</text>
-    <path class="avg-line" d="{escape_html(svg_path(avg_points))}"></path>
-    <path class="p90-line" d="{escape_html(svg_path(p90_points))}"></path>
+    <path class="avg-line" d="{escape_html(smooth_svg_path(avg_points))}"></path>
+    <path class="p90-line" d="{escape_html(smooth_svg_path(p90_points))}"></path>
     {avg_circles}
     {p90_circles}
-    {''.join(x_labels)}
+    {x_ticks}
   </svg>
   <div class="chart-legend">
     <span><i class="legend-swatch avg"></i>Avg release</span>
@@ -1150,6 +1216,7 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     .timeline-chart { display: block; width: 100%; min-width: 720px; height: auto; }
     .chart-frame { fill: #fff; stroke: #111; stroke-width: 1.2; }
     .chart-grid { stroke: #d8d8d8; stroke-width: 1; }
+    .chart-tick { stroke: #111; stroke-width: 1; }
     .chart-label { fill: #111; font-family: "Courier New", Courier, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
     .axis-title { font-size: 12px; font-weight: 700; }
     .x-label { font-size: 10px; }
