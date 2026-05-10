@@ -28,6 +28,11 @@ The script writes three files in the current directory:
   repeated sent-for-analysis events.
 - Missing sandbox verdicts for sent-for-analysis files are reported as canceled
   or incomplete.
+- Destination domains are derived from the WEB `URL` host and reported in top-25
+  tables for worst sandbox release time and highest block ratio.
+- Block ratio is based on WEB policy action and blocked-policy fields. Repeated
+  WEB events for the same MD5 count as one file, but any blocked event marks
+  that file as blocked for the domain metric.
 - User-specific report sections are intentionally omitted for privacy.
 
 ## Requirements

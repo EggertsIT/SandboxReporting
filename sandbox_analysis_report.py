@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import mean, median
+from urllib.parse import urlsplit
 
 
 MISSING_VALUES = {"", "none", "n/a", "na", "null", "-"}
@@ -23,6 +24,7 @@ SLA_BUCKETS = (
     ("> 10m", None),
 )
 SIZE_BUCKET_ORDER = ("Unknown", "< 1 MB", "1-10 MB", "10-50 MB", "50-100 MB", ">= 100 MB")
+BLOCK_ACTION_MARKERS = ("block", "deny", "denied", "drop", "reset")
 TZ_OFFSETS = {
     "UTC": 0,
     "GMT": 0,
@@ -225,6 +227,41 @@ def unique_join(rows: list[dict[str, str]], column: str, limit: int = 5) -> str:
         if len(values) >= limit:
             break
     return "; ".join(values)
+
+
+def extract_destination_domain(url: object) -> str:
+    text = clean(url)
+    if not text:
+        return ""
+
+    candidate = text if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", text) else f"//{text}"
+    parsed = urlsplit(candidate)
+    host = parsed.hostname or ""
+    if not host and parsed.netloc:
+        host = parsed.netloc.rsplit("@", 1)[-1].split(":", 1)[0]
+    return host.rstrip(".").lower()
+
+
+def destination_domain(web_group: list[dict[str, str]], selected_web_row: dict[str, str] | None) -> str:
+    selected_domain = extract_destination_domain((selected_web_row or {}).get("URL"))
+    if selected_domain:
+        return selected_domain
+    for row in web_group:
+        domain = extract_destination_domain(row.get("URL"))
+        if domain:
+            return domain
+    return "Unknown"
+
+
+def is_blocked_web_row(row: dict[str, str] | None) -> bool:
+    if not row:
+        return False
+
+    if clean(row.get("Blocked Policy Name")) or clean(row.get("Blocked Policy Type")):
+        return True
+
+    policy_action = clean(row.get("Policy Action")).lower()
+    return any(marker in policy_action for marker in BLOCK_ACTION_MARKERS)
 
 
 def sent_for_analysis_event_summary(rows: list[dict[str, str]], completed_time: datetime | None) -> dict[str, str]:
@@ -571,6 +608,102 @@ def canceled_or_incomplete_rows(rows: list[dict[str, str]], limit: int | None = 
     return output
 
 
+def destination_domain_stats(rows: list[dict[str, str]]) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        grouped[clean(row.get("destination_domain")) or "Unknown"].append(row)
+
+    output: list[dict[str, object]] = []
+    for domain, domain_rows in grouped.items():
+        sandbox_rows = duration_rows(domain_rows, include_known_by_cloud=False)
+        durations = [duration for _, duration in sandbox_rows]
+        stats = duration_stats(durations)
+        status_counts = Counter(clean(row.get("status")) or "unknown" for row in domain_rows)
+        blocked_count = sum(1 for row in domain_rows if clean(row.get("blocked")).lower() == "yes")
+        total_count = len(domain_rows)
+        worst_row = None
+        worst_duration = None
+        if sandbox_rows:
+            worst_row, worst_duration = max(sandbox_rows, key=lambda item: item[1])
+
+        output.append(
+            {
+                "domain": domain,
+                "total": total_count,
+                "sandboxed": sum(count for status, count in status_counts.items() if status.startswith("matched")),
+                "known_by_cloud": status_counts.get("known_by_cloud", 0),
+                "canceled_or_incomplete": status_counts.get("canceled_or_incomplete", 0),
+                "blocked": blocked_count,
+                "block_ratio": (blocked_count / total_count) if total_count else 0.0,
+                "avg_release": stats["avg"],
+                "p90_release": stats["p90"],
+                "worst_release": stats["max"],
+                "worst_file": clean((worst_row or {}).get("download_file_name")) or "",
+                "worst_verdict": clean((worst_row or {}).get("verdict")) or "",
+                "worst_status": clean((worst_row or {}).get("status")) or "",
+                "worst_md5": clean((worst_row or {}).get("md5")) or "",
+                "worst_duration": worst_duration,
+            }
+        )
+    return output
+
+
+def format_percent(value: float | int | None) -> str:
+    if value is None:
+        return ""
+    return f"{float(value) * 100:.1f}%"
+
+
+def domain_release_rows(rows: list[dict[str, str]], limit: int = 25) -> list[dict[str, str]]:
+    domain_rows = [
+        row for row in destination_domain_stats(rows)
+        if isinstance(row.get("worst_release"), (float, int))
+    ]
+    domain_rows.sort(
+        key=lambda row: (
+            float(row.get("worst_release") or 0),
+            float(row.get("p90_release") or 0),
+            float(row.get("avg_release") or 0),
+            int(row.get("sandboxed") or 0),
+        ),
+        reverse=True,
+    )
+    return [format_domain_row(row) for row in domain_rows[:limit]]
+
+
+def domain_block_ratio_rows(rows: list[dict[str, str]], limit: int = 25) -> list[dict[str, str]]:
+    domain_rows = [row for row in destination_domain_stats(rows) if int(row.get("blocked") or 0) > 0]
+    domain_rows.sort(
+        key=lambda row: (
+            float(row.get("block_ratio") or 0),
+            int(row.get("blocked") or 0),
+            int(row.get("total") or 0),
+            float(row.get("worst_release") or 0),
+        ),
+        reverse=True,
+    )
+    return [format_domain_row(row) for row in domain_rows[:limit]]
+
+
+def format_domain_row(row: dict[str, object]) -> dict[str, str]:
+    return {
+        "domain": str(row.get("domain") or "Unknown"),
+        "total": str(row.get("total") or 0),
+        "sandboxed": str(row.get("sandboxed") or 0),
+        "known_by_cloud": str(row.get("known_by_cloud") or 0),
+        "canceled_or_incomplete": str(row.get("canceled_or_incomplete") or 0),
+        "blocked": str(row.get("blocked") or 0),
+        "block_ratio": format_percent(float(row.get("block_ratio") or 0)),
+        "avg_release": format_seconds(row.get("avg_release") if isinstance(row.get("avg_release"), (float, int)) else None),
+        "p90_release": format_seconds(row.get("p90_release") if isinstance(row.get("p90_release"), (float, int)) else None),
+        "worst_release": format_seconds(row.get("worst_release") if isinstance(row.get("worst_release"), (float, int)) else None),
+        "worst_file": str(row.get("worst_file") or ""),
+        "worst_verdict": str(row.get("worst_verdict") or ""),
+        "worst_status": str(row.get("worst_status") or ""),
+        "worst_md5": str(row.get("worst_md5") or ""),
+    }
+
+
 def escape_html(value: object) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
@@ -668,6 +801,8 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
         {"metric": "Excluding known_by_cloud P90", "value": format_seconds(sandbox_stats["p90"])},
     ]
     top_rows = top_slowest_rows(detail_rows, limit=15)
+    domain_release_top = domain_release_rows(detail_rows, limit=25)
+    domain_block_ratio_top = domain_block_ratio_rows(detail_rows, limit=25)
     repeated_rows = repeated_sent_for_analysis_rows(detail_rows, limit=20)
     canceled_rows = canceled_or_incomplete_rows(detail_rows, limit=20)
     location_rows = grouped_operational_rows(detail_rows, "location")[:20]
@@ -694,6 +829,9 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
         ("download_file_type", "File type"),
         ("download_file_name", "File name"),
         ("received_bytes_human", "Size"),
+        ("destination_domain", "Destination domain"),
+        ("policy_action", "Policy action"),
+        ("blocked", "Blocked"),
         ("download_time", "Event time"),
         ("analysis_completed_time", "Completed"),
         ("md5", "MD5"),
@@ -707,6 +845,20 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
         ("status", "Status"),
         ("event_time", "Event time"),
         ("md5", "MD5"),
+    ]
+    domain_columns = [
+        ("domain", "Destination domain"),
+        ("total", "Files"),
+        ("sandboxed", "Sandboxed"),
+        ("known_by_cloud", "Known by cloud"),
+        ("canceled_or_incomplete", "Canceled/incomplete"),
+        ("blocked", "Blocked"),
+        ("block_ratio", "Block ratio"),
+        ("avg_release", "Avg release"),
+        ("p90_release", "P90 release"),
+        ("worst_release", "Worst release"),
+        ("worst_file", "Worst file"),
+        ("worst_verdict", "Worst verdict"),
     ]
     repeated_columns = [
         ("sent_for_analysis_count", "SFA events"),
@@ -843,6 +995,16 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     </section>
 
     <section class="panel table-panel">
+      <h2>Destination Domains by Worst Release Time</h2>
+      {render_table(domain_columns, domain_release_top, "No destination domains with measured sandbox release time")}
+    </section>
+
+    <section class="panel table-panel">
+      <h2>Destination Domains by Highest Block Ratio</h2>
+      {render_table(domain_columns, domain_block_ratio_top, "No blocked destination domains")}
+    </section>
+
+    <section class="panel table-panel">
       <h2>Repeated Sent for Analysis Events</h2>
       {render_table(repeated_columns, repeated_rows, "No files showed Sent for Analysis more than once before completion")}
     </section>
@@ -970,6 +1132,8 @@ def build_report(web_rows: list[dict[str, str]], verdict_rows: list[dict[str, st
 
         received_bytes = parse_int((web_row or {}).get("Received Bytes"))
         total_bytes = parse_int((web_row or {}).get("Total Bytes"))
+        domain = destination_domain(web_group, web_row)
+        blocked = any(is_blocked_web_row(row) for row in web_group) if web_group else False
 
         detail_rows.append(
             {
@@ -1001,6 +1165,11 @@ def build_report(web_rows: list[dict[str, str]], verdict_rows: list[dict[str, st
                 "client_external_ip": unique_join(web_group, "Client External IP"),
                 "source_ip_country": unique_join(web_group, "Source IP Country"),
                 "destination_ip_country": unique_join(web_group, "Destination IP Country"),
+                "destination_domain": domain,
+                "policy_action": unique_join(web_group, "Policy Action"),
+                "blocked": "yes" if blocked else "no",
+                "blocked_policy_name": unique_join(web_group, "Blocked Policy Name"),
+                "blocked_policy_type": unique_join(web_group, "Blocked Policy Type"),
                 "user_location": unique_join(web_group, "User Location"),
                 "url": unique_join(web_group, "URL", limit=3),
                 "web_event_count": str(len(web_group)),
@@ -1100,6 +1269,44 @@ def build_report(web_rows: list[dict[str, str]], verdict_rows: list[dict[str, st
     lines.append("")
     lines.extend(stats_lines("Decision durations, excluding known_by_cloud", sandbox_duration_values))
     lines.append("")
+    lines.extend(
+        ascii_table(
+            "Destination domains by worst release time",
+            [
+                ("domain", "Destination domain"),
+                ("total", "Files"),
+                ("sandboxed", "Sandboxed"),
+                ("blocked", "Blocked"),
+                ("block_ratio", "Block ratio"),
+                ("avg_release", "Avg"),
+                ("p90_release", "P90"),
+                ("worst_release", "Worst"),
+                ("worst_file", "Worst file"),
+            ],
+            domain_release_rows(detail_rows, limit=25),
+            {"domain": 42, "worst_file": 42},
+        )
+    )
+    lines.append("")
+    lines.extend(
+        ascii_table(
+            "Destination domains by highest block ratio",
+            [
+                ("domain", "Destination domain"),
+                ("total", "Files"),
+                ("sandboxed", "Sandboxed"),
+                ("blocked", "Blocked"),
+                ("block_ratio", "Block ratio"),
+                ("avg_release", "Avg"),
+                ("p90_release", "P90"),
+                ("worst_release", "Worst"),
+                ("worst_file", "Worst file"),
+            ],
+            domain_block_ratio_rows(detail_rows, limit=25),
+            {"domain": 42, "worst_file": 42},
+        )
+    )
+    lines.append("")
     lines.extend(grouped_counter_lines("File type status counts", status_counts_by_file_type))
     lines.append("")
     lines.extend(grouped_stats_lines("Durations by file type, including known_by_cloud", decision_durations_by_file_type))
@@ -1165,6 +1372,11 @@ def write_detail_csv(path: Path, rows: list[dict[str, str]]) -> None:
         "client_external_ip",
         "source_ip_country",
         "destination_ip_country",
+        "destination_domain",
+        "policy_action",
+        "blocked",
+        "blocked_policy_name",
+        "blocked_policy_type",
         "user_location",
         "url",
         "web_event_count",
