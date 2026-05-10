@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Source exports can contain sensitive operational data.
+*_WEB_log.csv
+*_SANDBOX_VERDICT_log.csv
+WEB_log.csv
+SANDBOX_VERDICT_log.csv
+
+# Generated report outputs.
+sandbox_analysis_report.html
+sandbox_analysis_report_summary.txt
+sandbox_analysis_report_details.csv
