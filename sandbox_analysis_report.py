@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import math
 import re
 import sys
 from collections import Counter, defaultdict
@@ -814,8 +815,36 @@ def timeline_finding_rows(stats_rows: list[dict[str, object]]) -> list[dict[str,
     return findings
 
 
-def svg_points(stats_rows: list[dict[str, object]], key: str, max_value: float, left: int, right: int, top: int, bottom: int) -> list[tuple[float, float]]:
-    if len(stats_rows) < 2 or max_value <= 0:
+def log_chart_bounds(values: list[float]) -> tuple[float, float]:
+    max_value = max(max(values), 1.0)
+    return 0.0, max(1.0, math.ceil(math.log10(max_value)))
+
+
+def log_tick_values(min_exp: float, max_exp: float) -> list[float]:
+    start = int(math.floor(min_exp))
+    end = int(math.ceil(max_exp))
+    exponents = list(range(start, end + 1))
+    if len(exponents) <= 6:
+        return [10 ** exponent for exponent in exponents]
+
+    step = max(1, math.ceil((len(exponents) - 1) / 5))
+    selected = exponents[::step]
+    if selected[-1] != exponents[-1]:
+        selected.append(exponents[-1])
+    return [10 ** exponent for exponent in selected]
+
+
+def svg_log_points(
+    stats_rows: list[dict[str, object]],
+    key: str,
+    min_exp: float,
+    max_exp: float,
+    left: int,
+    right: int,
+    top: int,
+    bottom: int,
+) -> list[tuple[float, float]]:
+    if len(stats_rows) < 2 or max_exp <= min_exp:
         return []
     span_x = right - left
     span_y = bottom - top
@@ -825,9 +854,10 @@ def svg_points(stats_rows: list[dict[str, object]], key: str, max_value: float, 
         value = row.get(key)
         if not isinstance(value, (float, int)):
             continue
-        numeric_value = float(value)
+        numeric_value = max(float(value), 1.0)
+        log_value = math.log10(numeric_value)
         x = left + (span_x * index / denominator)
-        y = bottom - ((numeric_value / max_value) * span_y)
+        y = bottom - (((log_value - min_exp) / (max_exp - min_exp)) * span_y)
         points.append((x, y))
     return points
 
@@ -859,14 +889,15 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
     ]
     if not duration_values:
         return '<p class="empty">No sandbox release durations for timeline chart</p>'
-    max_duration = max(max(duration_values), 1.0)
-    avg_points = svg_points(stats_rows, "avg_release", max_duration, left, right, top, bottom)
-    p90_points = svg_points(stats_rows, "p90_release", max_duration, left, right, top, bottom)
+    min_exp, max_exp = log_chart_bounds(duration_values)
+    avg_points = svg_log_points(stats_rows, "avg_release", min_exp, max_exp, left, right, top, bottom)
+    p90_points = svg_log_points(stats_rows, "p90_release", min_exp, max_exp, left, right, top, bottom)
 
-    duration_ticks = [0.0, max_duration / 2, max_duration]
+    duration_ticks = log_tick_values(min_exp, max_exp)
     grid_lines = []
     for value in duration_ticks:
-        y = bottom - ((value / max_duration) * (bottom - top)) if max_duration else bottom
+        tick_exp = math.log10(max(value, 1.0))
+        y = bottom - (((tick_exp - min_exp) / (max_exp - min_exp)) * (bottom - top))
         grid_lines.append(
             f'<line class="chart-grid" x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}"></line>'
             f'<text class="chart-label axis-label" x="{left - 10}" y="{y + 4:.1f}" text-anchor="end">{escape_html(format_seconds(value))}</text>'
@@ -889,10 +920,10 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
     p90_circles = "".join(f'<circle class="p90-point" cx="{x:.1f}" cy="{y:.1f}" r="3.4"></circle>' for x, y in p90_points) if len(p90_points) == 1 else ""
     return f"""
 <div class="chart-wrap">
-  <svg class="timeline-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Timeline chart showing average release and P90 release by hour">
+  <svg class="timeline-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Timeline chart showing average release and P90 release by hour on a log scale">
     <rect class="chart-frame" x="{left}" y="{top}" width="{right - left}" height="{bottom - top}"></rect>
     {''.join(grid_lines)}
-    <text class="chart-label axis-title" x="{left}" y="18">Release time</text>
+    <text class="chart-label axis-title" x="{left}" y="18">Release time, log scale</text>
     <path class="avg-line" d="{escape_html(svg_path(avg_points))}"></path>
     <path class="p90-line" d="{escape_html(svg_path(p90_points))}"></path>
     {avg_circles}
@@ -1122,13 +1153,13 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     .chart-label { fill: #111; font-family: "Courier New", Courier, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
     .axis-title { font-size: 12px; font-weight: 700; }
     .x-label { font-size: 10px; }
-    .avg-line { fill: none; stroke: #555; stroke-width: 2.2; stroke-dasharray: 8 5; }
-    .p90-line { fill: none; stroke: #111; stroke-width: 2.4; }
-    .avg-point { fill: #fff; stroke: #555; stroke-width: 1.5; }
-    .p90-point { fill: #111; stroke: #111; stroke-width: 1.5; }
+    .avg-line { fill: none; stroke: #555; stroke-width: 1.2; stroke-dasharray: 8 5; }
+    .p90-line { fill: none; stroke: #111; stroke-width: 1.4; }
+    .avg-point { fill: #fff; stroke: #555; stroke-width: 1.2; }
+    .p90-point { fill: #111; stroke: #111; stroke-width: 1.2; }
     .chart-legend { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 4px 0 12px; font-size: 12px; }
     .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
-    .legend-swatch { display: inline-block; width: 28px; height: 0; border-top: 3px solid #111; }
+    .legend-swatch { display: inline-block; width: 28px; height: 0; border-top: 2px solid #111; }
     .legend-swatch.avg { border-color: #555; border-top-style: dashed; }
     .legend-swatch.p90 { border-color: #111; }
     details summary { cursor: pointer; color: #111; font-weight: 700; margin-bottom: 12px; text-transform: uppercase; }
