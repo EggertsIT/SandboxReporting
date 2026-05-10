@@ -922,8 +922,9 @@ def render_timeline_x_ticks(stats_rows: list[dict[str, object]], axis_start: dat
     if not hours:
         return ""
 
+    multi_day = min(hours).date() != max(hours).date()
     ticks: list[tuple[datetime, str]] = []
-    if min(hours).date() != max(hours).date():
+    if multi_day:
         current = axis_start.replace(hour=0, minute=0, second=0, microsecond=0)
         while current <= axis_end:
             ticks.append((current, current.strftime("%m-%d 00:00")))
@@ -940,10 +941,17 @@ def render_timeline_x_ticks(stats_rows: list[dict[str, object]], axis_start: dat
             continue
         seen_labels.add(label)
         x = timeline_x(timestamp, axis_start, axis_end, left, right)
-        output.append(
-            f'<line class="chart-tick" x1="{x:.1f}" y1="{bottom}" x2="{x:.1f}" y2="{bottom + 5}"></line>'
-            f'<text class="chart-label x-label" x="{x:.1f}" y="{bottom + 26}" text-anchor="middle">{escape_html(label)}</text>'
-        )
+        output.append(f'<line class="chart-tick" x1="{x:.1f}" y1="{bottom}" x2="{x:.1f}" y2="{bottom + 5}"></line>')
+        if multi_day:
+            label_y = bottom + 10
+            output.append(
+                f'<text class="chart-label x-label x-label-vertical" x="{x:.1f}" y="{label_y}" '
+                f'text-anchor="start" transform="rotate(90 {x:.1f} {label_y})">{escape_html(label)}</text>'
+            )
+        else:
+            output.append(
+                f'<text class="chart-label x-label" x="{x:.1f}" y="{bottom + 26}" text-anchor="middle">{escape_html(label)}</text>'
+            )
     return "".join(output)
 
 
@@ -952,11 +960,13 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
         return '<p class="empty">Not enough hourly data for timeline chart</p>'
 
     width = 1040
-    height = 250
     left = 76
     right = 952
     top = 30
     bottom = 188
+    hours = [row.get("hour") for row in stats_rows if isinstance(row.get("hour"), datetime)]
+    multi_day = bool(hours and min(hours).date() != max(hours).date())
+    height = 300 if multi_day else 250
     duration_values = [
         float(row.get(key) or 0)
         for row in stats_rows
@@ -1220,6 +1230,7 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     .chart-label { fill: #111; font-family: "Courier New", Courier, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
     .axis-title { font-size: 12px; font-weight: 700; }
     .x-label { font-size: 10px; }
+    .x-label-vertical { font-size: 9px; }
     .avg-line { fill: none; stroke: #555; stroke-width: 1.2; stroke-dasharray: 8 5; }
     .p90-line { fill: none; stroke: #111; stroke-width: 1.4; }
     .avg-point { fill: #fff; stroke: #555; stroke-width: 1.2; }
@@ -1251,6 +1262,7 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
       .chart-label { font-size: 8px; }
       .axis-title { font-size: 9px; }
       .x-label { font-size: 7px; }
+      .x-label-vertical { font-size: 6.5px; }
       .chart-legend { font-size: 8px; gap: 6px 12px; margin-bottom: 6px; }
       .table-wrap { overflow: visible; border: none !important; }
       table { table-layout: fixed; width: 100%; font-size: 8.5px; line-height: 1.2; }
