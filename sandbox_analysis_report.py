@@ -753,10 +753,16 @@ def grouped_average_chart_items(grouped_values: dict[str, list[float]], order: t
         labels.extend(sorted(label for label in grouped_values if label not in order_set))
     else:
         labels = sorted(grouped_values, key=lambda label: (-mean(grouped_values[label]), label))
-    return [(label, float(mean(grouped_values[label])), f"{len(grouped_values[label])} files") for label in labels if grouped_values.get(label)]
+    return [(label, float(mean(grouped_values[label])), str(len(grouped_values[label]))) for label in labels if grouped_values.get(label)]
 
 
-def render_ascii_bar_table(items: list[tuple[str, float, str]], value_formatter, max_items: int = 12) -> str:
+def render_ascii_bar_table(
+    items: list[tuple[str, float, str]],
+    value_formatter,
+    max_items: int = 12,
+    value_label: str = "Value",
+    note_label: str | None = "Note",
+) -> str:
     visible_items = [(label, value, note) for label, value, note in items if value >= 0][:max_items]
     if not visible_items:
         return '<p class="empty">No data</p>'
@@ -764,8 +770,15 @@ def render_ascii_bar_table(items: list[tuple[str, float, str]], value_formatter,
     rows: list[dict[str, str]] = []
     for label, value, note in visible_items:
         bar_len = int(round((value / max_value) * 32)) if value else 0
-        rows.append({"label": label, "bar": "#" * max(1, bar_len) if value else "", "value": value_formatter(value), "note": note})
-    return render_table([("label", "Label"), ("bar", "Bar"), ("value", "Value"), ("note", "Note")], rows)
+        row = {"label": label, "bar": "#" * max(1, bar_len) if value else "", "value": value_formatter(value)}
+        if note_label is not None:
+            row["note"] = note
+        rows.append(row)
+
+    columns = [("label", "Label"), ("bar", "Bar"), ("value", value_label)]
+    if note_label is not None:
+        columns.append(("note", note_label))
+    return render_table(columns, rows)
 
 
 def render_metric_table(rows: list[dict[str, str]]) -> str:
@@ -987,23 +1000,23 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     <section class="grid">
       <section class="panel">
         <h2>Status Distribution</h2>
-        {render_ascii_bar_table(counter_chart_items(status_counts), lambda value: f"{int(value)}")}
+        {render_ascii_bar_table(counter_chart_items(status_counts), lambda value: f"{int(value)}", value_label="Count", note_label=None)}
       </section>
       <section class="panel">
         <h2>SLA Buckets Including known_by_cloud</h2>
-        {render_ascii_bar_table(counter_chart_items(sla_all, tuple(label for label, _ in SLA_BUCKETS)), lambda value: f"{int(value)}")}
+        {render_ascii_bar_table(counter_chart_items(sla_all, tuple(label for label, _ in SLA_BUCKETS)), lambda value: f"{int(value)}", value_label="Count", note_label=None)}
       </section>
       <section class="panel">
         <h2>SLA Buckets Excluding known_by_cloud</h2>
-        {render_ascii_bar_table(counter_chart_items(sla_sandbox, tuple(label for label, _ in SLA_BUCKETS)), lambda value: f"{int(value)}")}
+        {render_ascii_bar_table(counter_chart_items(sla_sandbox, tuple(label for label, _ in SLA_BUCKETS)), lambda value: f"{int(value)}", value_label="Count", note_label=None)}
       </section>
       <section class="panel">
         <h2>Avg Sandbox Duration by File Type</h2>
-        {render_ascii_bar_table(grouped_average_chart_items(file_type_sandbox), format_seconds)}
+        {render_ascii_bar_table(grouped_average_chart_items(file_type_sandbox), format_seconds, value_label="Avg", note_label="Files")}
       </section>
       <section class="panel">
         <h2>Avg Sandbox Duration by File Size</h2>
-        {render_ascii_bar_table(grouped_average_chart_items(size_sandbox, SIZE_BUCKET_ORDER), format_seconds)}
+        {render_ascii_bar_table(grouped_average_chart_items(size_sandbox, SIZE_BUCKET_ORDER), format_seconds, value_label="Avg", note_label="Files")}
       </section>
     </section>
 
