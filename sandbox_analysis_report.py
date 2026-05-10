@@ -796,7 +796,6 @@ def timeline_hourly_stats(rows: list[dict[str, str]]) -> list[dict[str, object]]
         output.append(
             {
                 "hour": hour,
-                "plot_time": hour + timedelta(minutes=30),
                 "hour_label": hour.strftime("%Y-%m-%d %H:00 UTC"),
                 "short_label": hour.strftime("%m-%d %H:%M"),
                 "total": len(hour_rows),
@@ -805,40 +804,12 @@ def timeline_hourly_stats(rows: list[dict[str, str]]) -> list[dict[str, object]]
                 "canceled_or_incomplete": canceled_count,
                 "repeated_sfa": repeated_count,
                 "sla_breaches": sla_breaches,
-                "median_release": stats["median"],
                 "avg_release": stats["avg"],
                 "p90_release": stats["p90"],
                 "worst_release": stats["max"],
             }
         )
     return output
-
-
-def timeline_raw_points(rows: list[dict[str, str]]) -> list[dict[str, object]]:
-    output: list[dict[str, object]] = []
-    for row, duration in duration_rows(rows, include_known_by_cloud=False):
-        timestamp_text = clean(row.get("download_time_utc"))
-        if not timestamp_text:
-            continue
-        try:
-            timestamp = parse_timestamp(timestamp_text)
-        except ValueError:
-            continue
-
-        output.append(
-            {
-                "timestamp": timestamp,
-                "duration": duration,
-                "verdict": clean(row.get("verdict")) or "Unknown",
-                "file_type": clean(row.get("download_file_type")) or "Unknown",
-                "domain": clean(row.get("destination_domain")) or "Unknown",
-                "file_name": clean(row.get("download_file_name")),
-                "md5": clean(row.get("md5")),
-                "sla_breach": duration > SLA_BREACH_SECONDS,
-            }
-        )
-
-    return sorted(output, key=lambda item: (item["timestamp"], float(item["duration"]), str(item.get("md5") or "")))
 
 
 def timeline_finding_rows(stats_rows: list[dict[str, object]]) -> list[dict[str, str]]:
@@ -850,10 +821,10 @@ def timeline_finding_rows(stats_rows: list[dict[str, object]]) -> list[dict[str,
     p90_candidates = [row for row in stats_rows if isinstance(row.get("p90_release"), (float, int))]
     if avg_candidates:
         row = max(avg_candidates, key=lambda item: float(item.get("avg_release") or 0))
-        findings.append({"metric": "Worst hourly avg release", "hour": str(row.get("hour_label")), "value": format_seconds(row.get("avg_release"))})
+        findings.append({"metric": "Worst avg release", "hour": str(row.get("hour_label")), "value": format_seconds(row.get("avg_release"))})
     if p90_candidates:
         row = max(p90_candidates, key=lambda item: float(item.get("p90_release") or 0))
-        findings.append({"metric": "Worst hourly P90 release", "hour": str(row.get("hour_label")), "value": format_seconds(row.get("p90_release"))})
+        findings.append({"metric": "Worst P90 release", "hour": str(row.get("hour_label")), "value": format_seconds(row.get("p90_release"))})
 
     busiest = max(stats_rows, key=lambda item: int(item.get("sandboxed") or 0))
     busiest_count = int(busiest.get("sandboxed") or 0)
@@ -887,7 +858,7 @@ def nice_duration_ceiling(seconds_value: float) -> float:
 
 
 def log_chart_bounds(values: list[float]) -> tuple[float, float]:
-    max_value = max(max(values), float(SLA_BREACH_SECONDS), 1.0)
+    max_value = max(max(values), 1.0)
     upper_value = nice_duration_ceiling(max_value)
     return 0.0, max(math.log10(upper_value), math.log10(2.0))
 
@@ -913,13 +884,14 @@ def log_tick_values(min_exp: float, max_exp: float) -> list[float]:
     return sorted(selected)
 
 
-def timeline_axis_bounds(timestamps: list[datetime]) -> tuple[datetime, datetime]:
-    if not timestamps:
+def timeline_axis_bounds(stats_rows: list[dict[str, object]]) -> tuple[datetime, datetime]:
+    hours = [row.get("hour") for row in stats_rows if isinstance(row.get("hour"), datetime)]
+    if not hours:
         now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
         return now, now + timedelta(hours=1)
 
-    data_start = min(timestamps)
-    data_end = max(timestamps)
+    data_start = min(hours)
+    data_end = max(hours)
     if data_start.date() != data_end.date():
         axis_start = data_start.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
@@ -936,20 +908,6 @@ def timeline_x(timestamp: datetime, axis_start: datetime, axis_end: datetime, le
     return left + ((right - left) * (offset_seconds / span_seconds))
 
 
-def timeline_y(value: float, min_exp: float, max_exp: float, top: int, bottom: int) -> float:
-    numeric_value = max(float(value), 1.0)
-    log_value = math.log10(numeric_value)
-    return bottom - (((log_value - min_exp) / (max_exp - min_exp)) * (bottom - top))
-
-
-def timeline_stat_timestamp(row: dict[str, object]) -> datetime | None:
-    plot_time = row.get("plot_time")
-    if isinstance(plot_time, datetime):
-        return plot_time
-    hour = row.get("hour")
-    return hour if isinstance(hour, datetime) else None
-
-
 def svg_log_points(
     stats_rows: list[dict[str, object]],
     key: str,
@@ -962,49 +920,28 @@ def svg_log_points(
     top: int,
     bottom: int,
 ) -> list[tuple[float, float]]:
-    if max_exp <= min_exp:
+    if len(stats_rows) < 2 or max_exp <= min_exp:
         return []
+    span_y = bottom - top
     points: list[tuple[float, float]] = []
     for row in stats_rows:
         value = row.get(key)
-        timestamp = timeline_stat_timestamp(row)
+        timestamp = row.get("hour")
         if not isinstance(value, (float, int)) or not isinstance(timestamp, datetime):
             continue
+        numeric_value = max(float(value), 1.0)
+        log_value = math.log10(numeric_value)
         x = timeline_x(timestamp, axis_start, axis_end, left, right)
-        y = timeline_y(float(value), min_exp, max_exp, top, bottom)
+        y = bottom - (((log_value - min_exp) / (max_exp - min_exp)) * span_y)
         points.append((x, y))
     return points
 
 
-def render_reference_lines(
-    min_exp: float,
-    max_exp: float,
-    left: int,
-    right: int,
-    top: int,
-    bottom: int,
-) -> str:
-    if max_exp <= min_exp:
-        return ""
-
-    output: list[str] = []
-    axis_top = 10**max_exp
-    references = [(300.0, "5m ref"), (float(SLA_BREACH_SECONDS), "10m SLA")]
-    if axis_top >= 3600:
-        references.append((3600.0, "1h ref"))
-    for value, label in references:
-        if value > axis_top * 1.000001:
-            continue
-        y = timeline_y(value, min_exp, max_exp, top, bottom)
-        output.append(
-            f'<line class="reference-line" x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}"></line>'
-            f'<text class="chart-label reference-label" x="{right + 8}" y="{y + 4:.1f}" text-anchor="start">{escape_html(label)}</text>'
-        )
-    return "".join(output)
-
-
-def render_raw_timeline_points(
-    raw_points: list[dict[str, object]],
+def render_timeline_markers(
+    stats_rows: list[dict[str, object]],
+    key: str,
+    css_class: str,
+    series_label: str,
     min_exp: float,
     max_exp: float,
     axis_start: datetime,
@@ -1018,26 +955,18 @@ def render_raw_timeline_points(
         return ""
 
     output: list[str] = []
-    for point in raw_points:
-        timestamp = point.get("timestamp")
-        duration = point.get("duration")
-        if not isinstance(timestamp, datetime) or not isinstance(duration, (float, int)):
+    span_y = bottom - top
+    for row in stats_rows:
+        value = row.get(key)
+        timestamp = row.get("hour")
+        if not isinstance(value, (float, int)) or not isinstance(timestamp, datetime):
             continue
+        numeric_value = max(float(value), 1.0)
+        log_value = math.log10(numeric_value)
         x = timeline_x(timestamp, axis_start, axis_end, left, right)
-        y = timeline_y(float(duration), min_exp, max_exp, top, bottom)
-        css_class = "raw-point raw-point-breach" if point.get("sla_breach") else "raw-point"
-        title_parts = [
-            f'Observed file {timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")}',
-            f"Duration: {format_seconds(duration)} ({float(duration):.0f}s)",
-            f"Verdict: {point.get('verdict') or 'Unknown'}",
-            f"File type: {point.get('file_type') or 'Unknown'}",
-            f"Destination: {point.get('domain') or 'Unknown'}",
-        ]
-        if point.get("file_name"):
-            title_parts.append(f"File: {point.get('file_name')}")
-        if point.get("md5"):
-            title_parts.append(f"MD5: {point.get('md5')}")
-        output.append(f'<circle class="{css_class}" cx="{x:.1f}" cy="{y:.1f}" r="2.6"><title>{escape_html(" | ".join(title_parts))}</title></circle>')
+        y = bottom - (((log_value - min_exp) / (max_exp - min_exp)) * span_y)
+        title = f'{series_label} {timestamp.strftime("%Y-%m-%d %H:00 UTC")}: {format_seconds(numeric_value)}'
+        output.append(f'<circle class="{css_class}" cx="{x:.1f}" cy="{y:.1f}" r="2.1"><title>{escape_html(title)}</title></circle>')
     return "".join(output)
 
 
@@ -1050,11 +979,33 @@ def svg_path(points: list[tuple[float, float]]) -> str:
     return " ".join(commands)
 
 
-def render_timeline_x_ticks(timestamps: list[datetime], axis_start: datetime, axis_end: datetime, left: int, right: int, bottom: int) -> str:
-    if not timestamps:
+def smooth_svg_path(points: list[tuple[float, float]]) -> str:
+    if len(points) < 3:
+        return svg_path(points)
+
+    commands = [f"M {points[0][0]:.1f} {points[0][1]:.1f}"]
+    for index in range(len(points) - 1):
+        p0 = points[index - 1] if index > 0 else points[index]
+        p1 = points[index]
+        p2 = points[index + 1]
+        p3 = points[index + 2] if index + 2 < len(points) else p2
+        c1x = p1[0] + (p2[0] - p0[0]) / 6
+        c1y = p1[1] + (p2[1] - p0[1]) / 6
+        c2x = p2[0] - (p3[0] - p1[0]) / 6
+        c2y = p2[1] - (p3[1] - p1[1]) / 6
+        commands.append(f"C {c1x:.1f} {c1y:.1f}, {c2x:.1f} {c2y:.1f}, {p2[0]:.1f} {p2[1]:.1f}")
+    return " ".join(commands)
+
+
+def render_timeline_x_ticks(stats_rows: list[dict[str, object]], axis_start: datetime, axis_end: datetime, left: int, right: int, bottom: int) -> str:
+    if not stats_rows:
         return ""
 
-    multi_day = min(timestamps).date() != max(timestamps).date()
+    hours = [row.get("hour") for row in stats_rows if isinstance(row.get("hour"), datetime)]
+    if not hours:
+        return ""
+
+    multi_day = min(hours).date() != max(hours).date()
     ticks: list[tuple[datetime, str]] = []
     if multi_day:
         current = axis_start.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1062,9 +1013,9 @@ def render_timeline_x_ticks(timestamps: list[datetime], axis_start: datetime, ax
             ticks.append((current, current.strftime("%m-%d 00:00")))
             current += timedelta(days=1)
     else:
-        ticks.append((min(timestamps), min(timestamps).strftime("%m-%d %H:%M")))
-        if max(timestamps) != min(timestamps):
-            ticks.append((max(timestamps), max(timestamps).strftime("%m-%d %H:%M")))
+        ticks.append((min(hours), min(hours).strftime("%m-%d %H:%M")))
+        if max(hours) != min(hours):
+            ticks.append((max(hours), max(hours).strftime("%m-%d %H:%M")))
 
     output: list[str] = []
     seen_labels: set[str] = set()
@@ -1087,72 +1038,65 @@ def render_timeline_x_ticks(timestamps: list[datetime], axis_start: datetime, ax
     return "".join(output)
 
 
-def render_timeline_svg(detail_rows: list[dict[str, str]], stats_rows: list[dict[str, object]]) -> str:
-    raw_points = timeline_raw_points(detail_rows)
-    if not raw_points:
-        return '<p class="empty">No measured sandbox release durations for scientific timeline</p>'
+def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
+    if len(stats_rows) < 2:
+        return '<p class="empty">Not enough hourly data for timeline chart</p>'
 
     width = 1040
     left = 76
-    right = 932
-    top = 34
-    bottom = 210
-    trend_rows = [
-        row
-        for row in stats_rows
-        if isinstance(row.get("median_release"), (float, int)) or isinstance(row.get("p90_release"), (float, int))
-    ]
-    timestamps = [point["timestamp"] for point in raw_points if isinstance(point.get("timestamp"), datetime)]
-    timestamps.extend(timestamp for row in trend_rows if (timestamp := timeline_stat_timestamp(row)) is not None)
-    multi_day = bool(timestamps and min(timestamps).date() != max(timestamps).date())
-    x_title_y = bottom + (92 if multi_day else 54)
-    height = bottom + (122 if multi_day else 82)
-    duration_values = [float(point["duration"]) for point in raw_points if isinstance(point.get("duration"), (float, int))]
-    duration_values.extend(
+    right = 952
+    top = 30
+    bottom = 188
+    hours = [row.get("hour") for row in stats_rows if isinstance(row.get("hour"), datetime)]
+    multi_day = bool(hours and min(hours).date() != max(hours).date())
+    height = 300 if multi_day else 250
+    duration_values = [
         float(row.get(key) or 0)
-        for row in trend_rows
-        for key in ("median_release", "p90_release")
+        for row in stats_rows
+        for key in ("avg_release", "p90_release")
         if isinstance(row.get(key), (float, int))
-    )
+    ]
+    if not duration_values:
+        return '<p class="empty">No sandbox release durations for timeline chart</p>'
     min_exp, max_exp = log_chart_bounds(duration_values)
-    axis_start, axis_end = timeline_axis_bounds(timestamps)
-    median_points = svg_log_points(trend_rows, "median_release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
-    p90_points = svg_log_points(trend_rows, "p90_release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
+    axis_start, axis_end = timeline_axis_bounds(stats_rows)
+    avg_points = svg_log_points(stats_rows, "avg_release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
+    p90_points = svg_log_points(stats_rows, "p90_release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
 
     duration_ticks = log_tick_values(min_exp, max_exp)
     grid_lines = []
     for value in duration_ticks:
-        y = timeline_y(value, min_exp, max_exp, top, bottom)
+        tick_exp = math.log10(max(value, 1.0))
+        y = bottom - (((tick_exp - min_exp) / (max_exp - min_exp)) * (bottom - top))
         grid_lines.append(
             f'<line class="chart-grid" x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}"></line>'
             f'<text class="chart-label axis-label" x="{left - 10}" y="{y + 4:.1f}" text-anchor="end">{escape_html(format_seconds(value))}</text>'
         )
 
-    x_ticks = render_timeline_x_ticks(timestamps, axis_start, axis_end, left, right, bottom)
-    reference_lines = render_reference_lines(min_exp, max_exp, left, right, top, bottom)
-    raw_markers = render_raw_timeline_points(raw_points, min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
+    x_ticks = render_timeline_x_ticks(stats_rows, axis_start, axis_end, left, right, bottom)
 
+    avg_markers = render_timeline_markers(
+        stats_rows, "avg_release", "avg-point", "Avg release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom
+    )
+    p90_markers = render_timeline_markers(
+        stats_rows, "p90_release", "p90-point", "P90 release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom
+    )
     return f"""
 <div class="chart-wrap">
-  <svg class="timeline-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Scientific timeline showing raw sandbox analysis durations with hourly median and P90 trends on a log scale">
+  <svg class="timeline-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Timeline chart showing average release and P90 release by hour on a log scale">
     <rect class="chart-frame" x="{left}" y="{top}" width="{right - left}" height="{bottom - top}"></rect>
     {''.join(grid_lines)}
-    {reference_lines}
-    <text class="chart-label axis-title" x="{left}" y="20">Sandbox duration, seconds (log scale)</text>
-    <text class="chart-label axis-title x-axis-title" x="{(left + right) / 2:.1f}" y="{x_title_y}" text-anchor="middle">Event time, UTC</text>
-    <path class="median-line" d="{escape_html(svg_path(median_points))}"></path>
-    <path class="p90-line" d="{escape_html(svg_path(p90_points))}"></path>
-    {raw_markers}
+    <text class="chart-label axis-title" x="{left}" y="18">Release time, log scale</text>
+    <path class="avg-line" d="{escape_html(smooth_svg_path(avg_points))}"></path>
+    <path class="p90-line" d="{escape_html(smooth_svg_path(p90_points))}"></path>
+    {avg_markers}
+    {p90_markers}
     {x_ticks}
   </svg>
   <div class="chart-legend">
-    <span><i class="legend-dot raw"></i>Measured file</span>
-    <span><i class="legend-dot breach"></i>&gt;10m file</span>
-    <span><i class="legend-swatch median"></i>Hourly median</span>
-    <span><i class="legend-swatch p90"></i>Hourly P90</span>
-    <span><i class="legend-swatch reference"></i>SLA references</span>
+    <span><i class="legend-swatch avg"></i>Avg release</span>
+    <span><i class="legend-swatch p90"></i>P90 release</span>
   </div>
-  <p class="chart-note">Scientific timeline: raw sandboxed files plus hourly median/P90, log-scaled duration axis. Known-by-cloud decisions excluded.</p>
 </div>
 """
 
@@ -1374,21 +1318,15 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     .axis-title { font-size: 12px; font-weight: 700; }
     .x-label { font-size: 10px; }
     .x-label-vertical { font-size: 9px; }
-    .reference-line { stroke: #777; stroke-width: 1; stroke-dasharray: 3 4; }
-    .reference-label { fill: #333; font-size: 9px; }
-    .median-line { fill: none; stroke: #555; stroke-width: 1.2; stroke-dasharray: 8 5; }
+    .avg-line { fill: none; stroke: #555; stroke-width: 1.2; stroke-dasharray: 8 5; }
     .p90-line { fill: none; stroke: #111; stroke-width: 1.4; }
-    .raw-point { fill: #fff; stroke: #111; stroke-width: 1.1; }
-    .raw-point-breach { fill: #111; stroke: #111; }
+    .avg-point { fill: #fff; stroke: #555; stroke-width: 1.2; }
+    .p90-point { fill: #111; stroke: #111; stroke-width: 1.2; }
     .chart-legend { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 4px 0 12px; font-size: 12px; }
     .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
-    .legend-dot { display: inline-block; width: 9px; height: 9px; border: 1px solid #111; border-radius: 50%; background: #fff; }
-    .legend-dot.breach { background: #111; }
     .legend-swatch { display: inline-block; width: 28px; height: 0; border-top: 2px solid #111; }
-    .legend-swatch.median { border-color: #555; border-top-style: dashed; }
+    .legend-swatch.avg { border-color: #555; border-top-style: dashed; }
     .legend-swatch.p90 { border-color: #111; }
-    .legend-swatch.reference { border-color: #777; border-top-style: dashed; }
-    .chart-note { margin: 2px 0 0; color: #333; font-size: 12px; }
     details summary { cursor: pointer; color: #111; font-weight: 700; margin-bottom: 12px; text-transform: uppercase; }
     pre { background: #f7f7f7; color: #111; border: 1px solid #111; padding: 14px; border-radius: 0; overflow: auto; font-size: 12px; line-height: 1.45; }
     @media (max-width: 820px) { .page { padding: 16px; } .grid { grid-template-columns: 1fr; } h1 { font-size: 24px; } }
@@ -1413,7 +1351,6 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
       .x-label { font-size: 7px; }
       .x-label-vertical { font-size: 6.5px; }
       .chart-legend { font-size: 8px; gap: 6px 12px; margin-bottom: 6px; }
-      .chart-note { font-size: 8px; margin-top: 0; }
       .table-wrap { overflow: visible; border: none !important; }
       table { table-layout: fixed; width: 100%; font-size: 8.5px; line-height: 1.2; }
       thead { display: table-header-group; }
@@ -1459,7 +1396,7 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
 
     <section class="panel table-panel">
       <h2>Timeline Findings</h2>
-      {render_timeline_svg(detail_rows, timeline_stats)}
+      {render_timeline_svg(timeline_stats)}
       {render_table(timeline_finding_columns, timeline_findings, "No timeline findings")}
     </section>
 
