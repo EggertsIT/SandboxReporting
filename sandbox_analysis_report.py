@@ -23,6 +23,7 @@ SLA_BUCKETS = (
     ("5-10m", 600),
     ("> 10m", None),
 )
+SLA_BREACH_SECONDS = 600
 SIZE_BUCKET_ORDER = ("Unknown", "< 1 MB", "1-10 MB", "10-50 MB", "50-100 MB", ">= 100 MB")
 BLOCK_ACTION_MARKERS = ("block", "deny", "denied", "drop", "reset")
 TZ_OFFSETS = {
@@ -736,6 +737,194 @@ def render_table(columns: list[tuple[str, str]], rows: list[dict[str, str]], emp
     return f'<div class="table-wrap"><table><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table></div>'
 
 
+def timeline_hourly_stats(rows: list[dict[str, str]]) -> list[dict[str, object]]:
+    grouped: dict[datetime, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        timestamp_text = clean(row.get("download_time_utc"))
+        if not timestamp_text:
+            continue
+        try:
+            timestamp = parse_timestamp(timestamp_text)
+        except ValueError:
+            continue
+        hour = timestamp.replace(minute=0, second=0, microsecond=0)
+        grouped[hour].append(row)
+
+    output: list[dict[str, object]] = []
+    for hour, hour_rows in sorted(grouped.items()):
+        sandbox_rows = duration_rows(hour_rows, include_known_by_cloud=False)
+        sandbox_durations = [duration for _, duration in sandbox_rows]
+        stats = duration_stats(sandbox_durations)
+        sandboxed_count = sum(1 for row in hour_rows if clean(row.get("status")).startswith("matched"))
+        known_by_cloud_count = sum(1 for row in hour_rows if clean(row.get("status")) == "known_by_cloud")
+        canceled_count = sum(1 for row in hour_rows if clean(row.get("canceled_or_incomplete")).lower() == "yes")
+        repeated_count = sum(1 for row in hour_rows if clean(row.get("repeated_sent_for_analysis")).lower() == "yes")
+        sla_breaches = sum(1 for _, duration in sandbox_rows if duration > SLA_BREACH_SECONDS)
+        output.append(
+            {
+                "hour": hour,
+                "hour_label": hour.strftime("%Y-%m-%d %H:00 UTC"),
+                "short_label": hour.strftime("%m-%d %H:%M"),
+                "total": len(hour_rows),
+                "sandboxed": sandboxed_count,
+                "known_by_cloud": known_by_cloud_count,
+                "canceled_or_incomplete": canceled_count,
+                "repeated_sfa": repeated_count,
+                "sla_breaches": sla_breaches,
+                "avg_release": stats["avg"],
+                "p90_release": stats["p90"],
+                "worst_release": stats["max"],
+            }
+        )
+    return output
+
+
+def timeline_table_rows(stats_rows: list[dict[str, object]]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for row in stats_rows:
+        rows.append(
+            {
+                "hour": str(row.get("hour_label") or ""),
+                "total": str(row.get("total") or 0),
+                "sandboxed": str(row.get("sandboxed") or 0),
+                "known_by_cloud": str(row.get("known_by_cloud") or 0),
+                "canceled_or_incomplete": str(row.get("canceled_or_incomplete") or 0),
+                "repeated_sfa": str(row.get("repeated_sfa") or 0),
+                "avg_release": format_seconds(row.get("avg_release") if isinstance(row.get("avg_release"), (float, int)) else None),
+                "p90_release": format_seconds(row.get("p90_release") if isinstance(row.get("p90_release"), (float, int)) else None),
+                "worst_release": format_seconds(row.get("worst_release") if isinstance(row.get("worst_release"), (float, int)) else None),
+                "sla_breaches": str(row.get("sla_breaches") or 0),
+            }
+        )
+    return rows
+
+
+def timeline_finding_rows(stats_rows: list[dict[str, object]]) -> list[dict[str, str]]:
+    if not stats_rows:
+        return []
+
+    findings: list[dict[str, str]] = []
+    avg_candidates = [row for row in stats_rows if isinstance(row.get("avg_release"), (float, int))]
+    p90_candidates = [row for row in stats_rows if isinstance(row.get("p90_release"), (float, int))]
+    if avg_candidates:
+        row = max(avg_candidates, key=lambda item: float(item.get("avg_release") or 0))
+        findings.append({"metric": "Worst avg release", "hour": str(row.get("hour_label")), "value": format_seconds(row.get("avg_release"))})
+    if p90_candidates:
+        row = max(p90_candidates, key=lambda item: float(item.get("p90_release") or 0))
+        findings.append({"metric": "Worst P90 release", "hour": str(row.get("hour_label")), "value": format_seconds(row.get("p90_release"))})
+
+    busiest = max(stats_rows, key=lambda item: int(item.get("sandboxed") or 0))
+    if int(busiest.get("sandboxed") or 0) > 0:
+        findings.append({"metric": "Busiest sandboxed hour", "hour": str(busiest.get("hour_label")), "value": f"{int(busiest.get('sandboxed') or 0)} files"})
+
+    canceled = max(stats_rows, key=lambda item: int(item.get("canceled_or_incomplete") or 0))
+    if int(canceled.get("canceled_or_incomplete") or 0) > 0:
+        findings.append({"metric": "Most canceled/incomplete", "hour": str(canceled.get("hour_label")), "value": f"{int(canceled.get('canceled_or_incomplete') or 0)} files"})
+
+    repeated = max(stats_rows, key=lambda item: int(item.get("repeated_sfa") or 0))
+    if int(repeated.get("repeated_sfa") or 0) > 0:
+        findings.append({"metric": "Most repeated SFA", "hour": str(repeated.get("hour_label")), "value": f"{int(repeated.get('repeated_sfa') or 0)} files"})
+    return findings
+
+
+def svg_points(stats_rows: list[dict[str, object]], key: str, max_value: float, left: int, right: int, top: int, bottom: int) -> list[tuple[float, float]]:
+    if len(stats_rows) < 2 or max_value <= 0:
+        return []
+    span_x = right - left
+    span_y = bottom - top
+    denominator = max(1, len(stats_rows) - 1)
+    points: list[tuple[float, float]] = []
+    for index, row in enumerate(stats_rows):
+        value = row.get(key)
+        if not isinstance(value, (float, int)):
+            continue
+        numeric_value = float(value)
+        x = left + (span_x * index / denominator)
+        y = bottom - ((numeric_value / max_value) * span_y)
+        points.append((x, y))
+    return points
+
+
+def svg_path(points: list[tuple[float, float]]) -> str:
+    if not points:
+        return ""
+    first_x, first_y = points[0]
+    commands = [f"M {first_x:.1f} {first_y:.1f}"]
+    commands.extend(f"L {x:.1f} {y:.1f}" for x, y in points[1:])
+    return " ".join(commands)
+
+
+def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
+    if len(stats_rows) < 2:
+        return '<p class="empty">Not enough hourly data for timeline chart</p>'
+
+    width = 1040
+    height = 330
+    left = 76
+    right = 952
+    top = 30
+    bottom = 258
+    duration_values = [
+        float(row.get(key) or 0)
+        for row in stats_rows
+        for key in ("avg_release", "p90_release")
+        if isinstance(row.get(key), (float, int))
+    ]
+    if not duration_values:
+        return '<p class="empty">No sandbox release durations for timeline chart</p>'
+    max_duration = max(max(duration_values), 1.0)
+    max_count = max((int(row.get("sandboxed") or 0) for row in stats_rows), default=1) or 1
+    avg_points = svg_points(stats_rows, "avg_release", max_duration, left, right, top, bottom)
+    p90_points = svg_points(stats_rows, "p90_release", max_duration, left, right, top, bottom)
+    count_points = svg_points(stats_rows, "sandboxed", float(max_count), left, right, top, bottom)
+
+    duration_ticks = [0.0, max_duration / 2, max_duration]
+    grid_lines = []
+    for value in duration_ticks:
+        y = bottom - ((value / max_duration) * (bottom - top)) if max_duration else bottom
+        grid_lines.append(
+            f'<line class="chart-grid" x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}"></line>'
+            f'<text class="chart-label axis-label" x="{left - 10}" y="{y + 4:.1f}" text-anchor="end">{escape_html(format_seconds(value))}</text>'
+        )
+
+    label_indices: set[int] = {0, len(stats_rows) - 1}
+    if len(stats_rows) > 2:
+        step = max(1, (len(stats_rows) - 1) // 4)
+        label_indices.update(range(0, len(stats_rows), step))
+    x_labels = []
+    for index, row in enumerate(stats_rows):
+        if index not in label_indices:
+            continue
+        x = left + ((right - left) * index / max(1, len(stats_rows) - 1))
+        x_labels.append(
+            f'<text class="chart-label x-label" x="{x:.1f}" y="{bottom + 28}" text-anchor="middle">{escape_html(row.get("short_label"))}</text>'
+        )
+
+    avg_circles = "".join(f'<circle class="avg-point" cx="{x:.1f}" cy="{y:.1f}" r="3"></circle>' for x, y in avg_points)
+    p90_circles = "".join(f'<circle class="p90-point" cx="{x:.1f}" cy="{y:.1f}" r="3"></circle>' for x, y in p90_points)
+    return f"""
+<div class="chart-wrap">
+  <svg class="timeline-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Timeline chart showing average release, P90 release, and sandboxed file count by hour">
+    <rect class="chart-frame" x="{left}" y="{top}" width="{right - left}" height="{bottom - top}"></rect>
+    {''.join(grid_lines)}
+    <text class="chart-label axis-title" x="{left}" y="18">Release time</text>
+    <text class="chart-label axis-title" x="{right}" y="18" text-anchor="end">Sandboxed files max {max_count}</text>
+    <path class="avg-line" d="{escape_html(svg_path(avg_points))}"></path>
+    <path class="p90-line" d="{escape_html(svg_path(p90_points))}"></path>
+    <path class="count-line" d="{escape_html(svg_path(count_points))}"></path>
+    {avg_circles}
+    {p90_circles}
+    {''.join(x_labels)}
+  </svg>
+  <div class="chart-legend">
+    <span><i class="legend-swatch avg"></i>Avg release</span>
+    <span><i class="legend-swatch p90"></i>P90 release</span>
+    <span><i class="legend-swatch count"></i>Sandboxed file count</span>
+  </div>
+</div>
+"""
+
+
 def counter_chart_items(counts: Counter[str], order: tuple[str, ...] | None = None) -> list[tuple[str, float, str]]:
     if order:
         order_set = set(order)
@@ -830,6 +1019,9 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
         {"metric": "Excluding known_by_cloud avg", "value": format_seconds(sandbox_stats["avg"])},
         {"metric": "Excluding known_by_cloud P90", "value": format_seconds(sandbox_stats["p90"])},
     ]
+    timeline_stats = timeline_hourly_stats(detail_rows)
+    timeline_findings = timeline_finding_rows(timeline_stats)
+    timeline_rows = timeline_table_rows(timeline_stats)
     top_rows = top_slowest_rows(detail_rows, limit=15)
     domain_release_top = domain_release_rows(detail_rows, limit=25)
     domain_avg_release_top = domain_avg_release_rows(detail_rows, limit=25)
@@ -891,6 +1083,23 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
         ("worst_file", "Worst file"),
         ("worst_verdict", "Worst verdict"),
     ]
+    timeline_finding_columns = [
+        ("metric", "Metric"),
+        ("hour", "Hour"),
+        ("value", "Value"),
+    ]
+    timeline_columns = [
+        ("hour", "Hour"),
+        ("total", "Total"),
+        ("sandboxed", "Sandboxed"),
+        ("known_by_cloud", "Known by cloud"),
+        ("canceled_or_incomplete", "Canceled/incomplete"),
+        ("repeated_sfa", "Repeated SFA"),
+        ("avg_release", "Avg release"),
+        ("p90_release", "P90 release"),
+        ("worst_release", "Worst release"),
+        ("sla_breaches", ">10m breaches"),
+    ]
     repeated_columns = [
         ("sent_for_analysis_count", "SFA events"),
         ("extra_events", "Extra"),
@@ -937,6 +1146,24 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     td { color: #111; }
     tbody tr:nth-child(even) td { background: #f7f7f7; }
     .empty { color: #333; margin: 0; }
+    .chart-wrap { overflow-x: auto; margin: 0 0 12px; }
+    .timeline-chart { display: block; width: 100%; min-width: 720px; height: auto; }
+    .chart-frame { fill: #fff; stroke: #111; stroke-width: 1.2; }
+    .chart-grid { stroke: #d8d8d8; stroke-width: 1; }
+    .chart-label { fill: #111; font-family: "Courier New", Courier, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+    .axis-title { font-size: 12px; font-weight: 700; }
+    .x-label { font-size: 10px; }
+    .avg-line { fill: none; stroke: #555; stroke-width: 2.4; }
+    .p90-line { fill: none; stroke: #111; stroke-width: 2.4; }
+    .count-line { fill: none; stroke: #888; stroke-width: 2; stroke-dasharray: 7 5; }
+    .avg-point { fill: #fff; stroke: #555; stroke-width: 1.5; }
+    .p90-point { fill: #111; stroke: #111; stroke-width: 1.5; }
+    .chart-legend { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 4px 0 12px; font-size: 12px; }
+    .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .legend-swatch { display: inline-block; width: 28px; height: 0; border-top: 3px solid #111; }
+    .legend-swatch.avg { border-color: #555; }
+    .legend-swatch.p90 { border-color: #111; }
+    .legend-swatch.count { border-color: #888; border-top-style: dashed; }
     details summary { cursor: pointer; color: #111; font-weight: 700; margin-bottom: 12px; text-transform: uppercase; }
     pre { background: #f7f7f7; color: #111; border: 1px solid #111; padding: 14px; border-radius: 0; overflow: auto; font-size: 12px; line-height: 1.45; }
     @media (max-width: 820px) { .page { padding: 16px; } .grid { grid-template-columns: 1fr; } h1 { font-size: 24px; } }
@@ -954,6 +1181,12 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
       .grid { display: block; }
       .panel { border: 1px solid #cbd5e1; border-radius: 4px; padding: 8px; margin: 0 0 8px; break-inside: avoid; page-break-inside: avoid; overflow: visible; }
       .panel.table-panel { break-inside: auto; page-break-inside: auto; }
+      .chart-wrap { overflow: visible; break-inside: avoid; page-break-inside: avoid; }
+      .timeline-chart { min-width: 0; }
+      .chart-label { font-size: 8px; }
+      .axis-title { font-size: 9px; }
+      .x-label { font-size: 7px; }
+      .chart-legend { font-size: 8px; gap: 6px 12px; margin-bottom: 6px; }
       .table-wrap { overflow: visible; border: none !important; }
       table { table-layout: fixed; width: 100%; font-size: 8.5px; line-height: 1.2; }
       thead { display: table-header-group; }
@@ -995,6 +1228,13 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     <section class="panel table-panel">
       <h2>Decision Duration Summary</h2>
       {render_table([("metric", "Metric"), ("value", "Value")], decision_summary_rows)}
+    </section>
+
+    <section class="panel table-panel">
+      <h2>Timeline Findings</h2>
+      {render_timeline_svg(timeline_stats)}
+      {render_table(timeline_finding_columns, timeline_findings, "No timeline findings")}
+      {render_table(timeline_columns, timeline_rows, "No hourly timeline data")}
     </section>
 
     <section class="grid">
@@ -1215,6 +1455,7 @@ def build_report(web_rows: list[dict[str, str]], verdict_rows: list[dict[str, st
             }
         )
 
+    timeline_stats = timeline_hourly_stats(detail_rows)
     lines: list[str] = []
     lines.extend(
         ascii_table(
@@ -1252,6 +1493,35 @@ def build_report(web_rows: list[dict[str, str]], verdict_rows: list[dict[str, st
             [("status", "Status"), ("count", "Count")],
             [{"status": status, "count": count} for status, count in sorted(status_counts.items())],
             {"status": 36},
+        )
+    )
+    lines.append("")
+    lines.extend(
+        ascii_table(
+            "Timeline Findings",
+            [("metric", "Metric"), ("hour", "Hour"), ("value", "Value")],
+            timeline_finding_rows(timeline_stats),
+            {"metric": 28, "hour": 24},
+        )
+    )
+    lines.append("")
+    lines.extend(
+        ascii_table(
+            "Hourly Timeline Metrics",
+            [
+                ("hour", "Hour"),
+                ("total", "Total"),
+                ("sandboxed", "Sandboxed"),
+                ("known_by_cloud", "Known"),
+                ("canceled_or_incomplete", "Canceled"),
+                ("repeated_sfa", "Repeated"),
+                ("avg_release", "Avg"),
+                ("p90_release", "P90"),
+                ("worst_release", "Worst"),
+                ("sla_breaches", ">10m"),
+            ],
+            timeline_table_rows(timeline_stats),
+            {"hour": 24},
         )
     )
 
