@@ -671,6 +671,23 @@ def domain_release_rows(rows: list[dict[str, str]], limit: int = 25) -> list[dic
     return [format_domain_row(row) for row in domain_rows[:limit]]
 
 
+def domain_avg_release_rows(rows: list[dict[str, str]], limit: int = 25) -> list[dict[str, str]]:
+    domain_rows = [
+        row for row in destination_domain_stats(rows)
+        if isinstance(row.get("avg_release"), (float, int))
+    ]
+    domain_rows.sort(
+        key=lambda row: (
+            float(row.get("avg_release") or 0),
+            float(row.get("p90_release") or 0),
+            float(row.get("worst_release") or 0),
+            int(row.get("sandboxed") or 0),
+        ),
+        reverse=True,
+    )
+    return [format_domain_row(row) for row in domain_rows[:limit]]
+
+
 def domain_block_ratio_rows(rows: list[dict[str, str]], limit: int = 25) -> list[dict[str, str]]:
     domain_rows = [row for row in destination_domain_stats(rows) if int(row.get("blocked") or 0) > 0]
     domain_rows.sort(
@@ -802,6 +819,7 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     ]
     top_rows = top_slowest_rows(detail_rows, limit=15)
     domain_release_top = domain_release_rows(detail_rows, limit=25)
+    domain_avg_release_top = domain_avg_release_rows(detail_rows, limit=25)
     domain_block_ratio_top = domain_block_ratio_rows(detail_rows, limit=25)
     repeated_rows = repeated_sent_for_analysis_rows(detail_rows, limit=20)
     canceled_rows = canceled_or_incomplete_rows(detail_rows, limit=20)
@@ -997,6 +1015,11 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     <section class="panel table-panel">
       <h2>Destination Domains by Worst Release Time</h2>
       {render_table(domain_columns, domain_release_top, "No destination domains with measured sandbox release time")}
+    </section>
+
+    <section class="panel table-panel">
+      <h2>Destination Domains by Worst Avg Release Time</h2>
+      {render_table(domain_columns, domain_avg_release_top, "No destination domains with measured average sandbox release time")}
     </section>
 
     <section class="panel table-panel">
@@ -1284,6 +1307,25 @@ def build_report(web_rows: list[dict[str, str]], verdict_rows: list[dict[str, st
                 ("worst_file", "Worst file"),
             ],
             domain_release_rows(detail_rows, limit=25),
+            {"domain": 42, "worst_file": 42},
+        )
+    )
+    lines.append("")
+    lines.extend(
+        ascii_table(
+            "Destination domains by worst avg release time",
+            [
+                ("domain", "Destination domain"),
+                ("total", "Files"),
+                ("sandboxed", "Sandboxed"),
+                ("blocked", "Blocked"),
+                ("block_ratio", "Block ratio"),
+                ("avg_release", "Avg"),
+                ("p90_release", "P90"),
+                ("worst_release", "Worst"),
+                ("worst_file", "Worst file"),
+            ],
+            domain_avg_release_rows(detail_rows, limit=25),
             {"domain": 42, "worst_file": 42},
         )
     )
