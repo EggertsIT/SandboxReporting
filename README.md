@@ -34,7 +34,9 @@ The script writes three files in the current directory:
 - Timeline findings are grouped by UTC hour and include a compact smoothed
   static inline SVG chart in the HTML report for avg release and P90 release on
   a log-scaled release-time axis. Multi-day charts label each UTC day at 00:00
-  with vertical day labels.
+  with vertical day labels. Duration-axis ticks use human-friendly time
+  ceilings instead of powers of ten, and plotted points include hover titles for
+  the exact hourly values.
   The text summary keeps only the compact timeline findings.
 - Block ratio is based on WEB policy action and blocked-policy fields. Repeated
   WEB events for the same MD5 count as one file, but any blocked event marks

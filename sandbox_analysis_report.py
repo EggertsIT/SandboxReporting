@@ -27,6 +27,34 @@ SLA_BUCKETS = (
 SLA_BREACH_SECONDS = 600
 SIZE_BUCKET_ORDER = ("Unknown", "< 1 MB", "1-10 MB", "10-50 MB", "50-100 MB", ">= 100 MB")
 BLOCK_ACTION_MARKERS = ("block", "deny", "denied", "drop", "reset")
+DURATION_AXIS_STEPS = (
+    1,
+    2,
+    5,
+    10,
+    15,
+    30,
+    60,
+    120,
+    300,
+    600,
+    900,
+    1800,
+    3600,
+    7200,
+    10800,
+    14400,
+    21600,
+    28800,
+    43200,
+    86400,
+    172800,
+    259200,
+    604800,
+    1209600,
+    2592000,
+    7776000,
+)
 TZ_OFFSETS = {
     "UTC": 0,
     "GMT": 0,
@@ -815,23 +843,45 @@ def timeline_finding_rows(stats_rows: list[dict[str, object]]) -> list[dict[str,
     return findings
 
 
+def nice_duration_ceiling(seconds_value: float) -> float:
+    target = max(float(seconds_value) * 1.08, 1.0)
+    for candidate in DURATION_AXIS_STEPS:
+        if candidate >= target:
+            return float(candidate)
+
+    magnitude = 10 ** math.floor(math.log10(target))
+    for multiplier in (1, 2, 5, 10):
+        candidate = multiplier * magnitude
+        if candidate >= target:
+            return float(candidate)
+    return float(10 * magnitude)
+
+
 def log_chart_bounds(values: list[float]) -> tuple[float, float]:
     max_value = max(max(values), 1.0)
-    return 0.0, max(1.0, math.ceil(math.log10(max_value)))
+    upper_value = nice_duration_ceiling(max_value)
+    return 0.0, max(math.log10(upper_value), math.log10(2.0))
 
 
 def log_tick_values(min_exp: float, max_exp: float) -> list[float]:
-    start = int(math.floor(min_exp))
-    end = int(math.ceil(max_exp))
-    exponents = list(range(start, end + 1))
-    if len(exponents) <= 6:
-        return [10 ** exponent for exponent in exponents]
+    min_value = 10**min_exp
+    max_value = 10**max_exp
+    candidates = [float(value) for value in DURATION_AXIS_STEPS if min_value <= value <= max_value * 1.000001]
+    if not candidates:
+        return [min_value, max_value]
+    if not math.isclose(candidates[0], min_value, rel_tol=0.0, abs_tol=0.001):
+        candidates.insert(0, min_value)
+    if not math.isclose(candidates[-1], max_value, rel_tol=0.0, abs_tol=0.001):
+        candidates.append(max_value)
+    if len(candidates) <= 7:
+        return candidates
 
-    step = max(1, math.ceil((len(exponents) - 1) / 5))
-    selected = exponents[::step]
-    if selected[-1] != exponents[-1]:
-        selected.append(exponents[-1])
-    return [10 ** exponent for exponent in selected]
+    selected = {candidates[0], candidates[-1]}
+    for index in range(1, 6):
+        target_exp = min_exp + ((max_exp - min_exp) * (index / 6))
+        target_value = 10**target_exp
+        selected.add(min(candidates, key=lambda value: abs(math.log10(value) - math.log10(target_value))))
+    return sorted(selected)
 
 
 def timeline_axis_bounds(stats_rows: list[dict[str, object]]) -> tuple[datetime, datetime]:
@@ -885,6 +935,39 @@ def svg_log_points(
         y = bottom - (((log_value - min_exp) / (max_exp - min_exp)) * span_y)
         points.append((x, y))
     return points
+
+
+def render_timeline_markers(
+    stats_rows: list[dict[str, object]],
+    key: str,
+    css_class: str,
+    series_label: str,
+    min_exp: float,
+    max_exp: float,
+    axis_start: datetime,
+    axis_end: datetime,
+    left: int,
+    right: int,
+    top: int,
+    bottom: int,
+) -> str:
+    if max_exp <= min_exp:
+        return ""
+
+    output: list[str] = []
+    span_y = bottom - top
+    for row in stats_rows:
+        value = row.get(key)
+        timestamp = row.get("hour")
+        if not isinstance(value, (float, int)) or not isinstance(timestamp, datetime):
+            continue
+        numeric_value = max(float(value), 1.0)
+        log_value = math.log10(numeric_value)
+        x = timeline_x(timestamp, axis_start, axis_end, left, right)
+        y = bottom - (((log_value - min_exp) / (max_exp - min_exp)) * span_y)
+        title = f'{series_label} {timestamp.strftime("%Y-%m-%d %H:00 UTC")}: {format_seconds(numeric_value)}'
+        output.append(f'<circle class="{css_class}" cx="{x:.1f}" cy="{y:.1f}" r="2.1"><title>{escape_html(title)}</title></circle>')
+    return "".join(output)
 
 
 def svg_path(points: list[tuple[float, float]]) -> str:
@@ -992,8 +1075,12 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
 
     x_ticks = render_timeline_x_ticks(stats_rows, axis_start, axis_end, left, right, bottom)
 
-    avg_circles = "".join(f'<circle class="avg-point" cx="{x:.1f}" cy="{y:.1f}" r="3.4"></circle>' for x, y in avg_points) if len(avg_points) == 1 else ""
-    p90_circles = "".join(f'<circle class="p90-point" cx="{x:.1f}" cy="{y:.1f}" r="3.4"></circle>' for x, y in p90_points) if len(p90_points) == 1 else ""
+    avg_markers = render_timeline_markers(
+        stats_rows, "avg_release", "avg-point", "Avg release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom
+    )
+    p90_markers = render_timeline_markers(
+        stats_rows, "p90_release", "p90-point", "P90 release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom
+    )
     return f"""
 <div class="chart-wrap">
   <svg class="timeline-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Timeline chart showing average release and P90 release by hour on a log scale">
@@ -1002,8 +1089,8 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
     <text class="chart-label axis-title" x="{left}" y="18">Release time, log scale</text>
     <path class="avg-line" d="{escape_html(smooth_svg_path(avg_points))}"></path>
     <path class="p90-line" d="{escape_html(smooth_svg_path(p90_points))}"></path>
-    {avg_circles}
-    {p90_circles}
+    {avg_markers}
+    {p90_markers}
     {x_ticks}
   </svg>
   <div class="chart-legend">
