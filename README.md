@@ -34,9 +34,11 @@ The script writes three files in the current directory:
 - Timeline findings are grouped by UTC hour and include a compact static inline
   SVG bubble chart in the HTML report. Each bubble is one UTC hour: x-axis is
   time, y-axis is average sandbox release time on a log scale, and bubble size
-  is sandboxed file volume. Multi-day charts label each UTC day at 00:00 with
-  vertical day labels, and bubble hover titles include P90, worst release, and
-  operational counts.
+  is sandboxed file volume. The chart uses wider scrollable timelines for
+  longer ranges, smaller capped bubbles, and vertical day grid lines for
+  readability. Multi-day charts label each UTC day at 00:00 with vertical day
+  labels, and bubble hover titles include P90, worst release, and operational
+  counts.
   The text summary keeps only the compact timeline findings.
 - Block ratio is based on WEB policy action and blocked-policy fields. Repeated
   WEB events for the same MD5 count as one file, but any blocked event marks

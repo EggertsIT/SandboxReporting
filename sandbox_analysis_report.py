@@ -902,6 +902,18 @@ def timeline_axis_bounds(stats_rows: list[dict[str, object]]) -> tuple[datetime,
     return axis_start, axis_end
 
 
+def timeline_chart_dimensions(axis_start: datetime, axis_end: datetime, multi_day: bool) -> tuple[int, int, int, int, int, int]:
+    left = 82
+    top = 38
+    bottom = 278
+    span_hours = max(1.0, (axis_end - axis_start).total_seconds() / 3600)
+    plot_width = int(max(900, min(4200, span_hours * 12)))
+    right = left + plot_width
+    width = right + 120
+    height = bottom + (116 if multi_day else 78)
+    return width, left, right, top, bottom, height
+
+
 def timeline_x(timestamp: datetime, axis_start: datetime, axis_end: datetime, left: int, right: int) -> float:
     span_seconds = max(1.0, (axis_end - axis_start).total_seconds())
     offset_seconds = (timestamp - axis_start).total_seconds()
@@ -926,9 +938,9 @@ def timeline_bubble_rows(stats_rows: list[dict[str, object]]) -> list[dict[str, 
 
 def bubble_radius(count: int, max_count: int) -> float:
     if max_count <= 1:
-        return 7.0
+        return 5.5
     scaled = math.sqrt(max(count, 1)) / math.sqrt(max_count)
-    return 5.0 + (scaled * 11.0)
+    return 4.0 + (scaled * 8.0)
 
 
 def render_timeline_reference_lines(min_exp: float, max_exp: float, left: int, right: int, top: int, bottom: int) -> str:
@@ -987,7 +999,15 @@ def render_timeline_bubbles(
     return "".join(output)
 
 
-def render_timeline_x_ticks(stats_rows: list[dict[str, object]], axis_start: datetime, axis_end: datetime, left: int, right: int, bottom: int) -> str:
+def render_timeline_x_ticks(
+    stats_rows: list[dict[str, object]],
+    axis_start: datetime,
+    axis_end: datetime,
+    left: int,
+    right: int,
+    top: int,
+    bottom: int,
+) -> str:
     if not stats_rows:
         return ""
 
@@ -1003,9 +1023,18 @@ def render_timeline_x_ticks(stats_rows: list[dict[str, object]], axis_start: dat
             ticks.append((current, current.strftime("%m-%d 00:00")))
             current += timedelta(days=1)
     else:
-        ticks.append((min(hours), min(hours).strftime("%m-%d %H:%M")))
-        if max(hours) != min(hours):
-            ticks.append((max(hours), max(hours).strftime("%m-%d %H:%M")))
+        span_hours = max(1.0, (axis_end - axis_start).total_seconds() / 3600)
+        if span_hours <= 6:
+            ticks.append((min(hours), min(hours).strftime("%m-%d %H:%M")))
+            if max(hours) != min(hours):
+                ticks.append((max(hours), max(hours).strftime("%m-%d %H:%M")))
+        else:
+            step_hours = 2 if span_hours <= 12 else 4
+            current = axis_start.replace(minute=0, second=0, microsecond=0)
+            while current <= axis_end:
+                if current >= axis_start:
+                    ticks.append((current, current.strftime("%m-%d %H:%M")))
+                current += timedelta(hours=step_hours)
 
     output: list[str] = []
     seen_labels: set[str] = set()
@@ -1014,6 +1043,8 @@ def render_timeline_x_ticks(stats_rows: list[dict[str, object]], axis_start: dat
             continue
         seen_labels.add(label)
         x = timeline_x(timestamp, axis_start, axis_end, left, right)
+        if multi_day:
+            output.append(f'<line class="chart-day-grid" x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{bottom}"></line>')
         output.append(f'<line class="chart-tick" x1="{x:.1f}" y1="{bottom}" x2="{x:.1f}" y2="{bottom + 5}"></line>')
         if multi_day:
             label_y = bottom + 10
@@ -1033,14 +1064,8 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
     if not bubble_rows:
         return '<p class="empty">No sandbox release durations for timeline bubble chart</p>'
 
-    width = 1040
-    left = 76
-    right = 932
-    top = 30
-    bottom = 188
-    hours = [row.get("hour") for row in stats_rows if isinstance(row.get("hour"), datetime)]
+    hours = [row.get("hour") for row in bubble_rows if isinstance(row.get("hour"), datetime)]
     multi_day = bool(hours and min(hours).date() != max(hours).date())
-    height = 300 if multi_day else 250
     duration_values = [
         float(row.get(key) or 0)
         for row in bubble_rows
@@ -1048,7 +1073,8 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
         if isinstance(row.get(key), (float, int))
     ]
     min_exp, max_exp = log_chart_bounds(duration_values)
-    axis_start, axis_end = timeline_axis_bounds(stats_rows)
+    axis_start, axis_end = timeline_axis_bounds(bubble_rows)
+    width, left, right, top, bottom, height = timeline_chart_dimensions(axis_start, axis_end, multi_day)
 
     duration_ticks = log_tick_values(min_exp, max_exp)
     grid_lines = []
@@ -1059,7 +1085,7 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
             f'<text class="chart-label axis-label" x="{left - 10}" y="{y + 4:.1f}" text-anchor="end">{escape_html(format_seconds(value))}</text>'
         )
 
-    x_ticks = render_timeline_x_ticks(stats_rows, axis_start, axis_end, left, right, bottom)
+    x_ticks = render_timeline_x_ticks(bubble_rows, axis_start, axis_end, left, right, top, bottom)
     reference_lines = render_timeline_reference_lines(min_exp, max_exp, left, right, top, bottom)
     bubbles = render_timeline_bubbles(bubble_rows, min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
     max_count = max((int(row.get("sandboxed") or 0) for row in bubble_rows), default=1)
@@ -1072,7 +1098,7 @@ def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
         )
     return f"""
 <div class="chart-wrap">
-  <svg class="timeline-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Timeline bubble chart showing average sandbox release time by UTC hour; bubble size shows sandboxed file volume">
+  <svg class="timeline-chart" style="min-width:{width}px" viewBox="0 0 {width} {height}" role="img" aria-label="Timeline bubble chart showing average sandbox release time by UTC hour; bubble size shows sandboxed file volume">
     <rect class="chart-frame" x="{left}" y="{top}" width="{right - left}" height="{bottom - top}"></rect>
     {''.join(grid_lines)}
     {reference_lines}
@@ -1301,6 +1327,7 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     .timeline-chart { display: block; width: 100%; min-width: 720px; height: auto; }
     .chart-frame { fill: #fff; stroke: #111; stroke-width: 1.2; }
     .chart-grid { stroke: #d8d8d8; stroke-width: 1; }
+    .chart-day-grid { stroke: #eeeeee; stroke-width: 1; }
     .chart-tick { stroke: #111; stroke-width: 1; }
     .chart-label { fill: #111; font-family: "Courier New", Courier, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
     .axis-title { font-size: 12px; font-weight: 700; }
@@ -1308,8 +1335,8 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     .x-label-vertical { font-size: 9px; }
     .reference-line { stroke: #777; stroke-width: 1; stroke-dasharray: 3 4; }
     .reference-label { fill: #333; font-size: 9px; }
-    .timeline-bubble { fill: #fff; fill-opacity: 0.9; stroke: #111; stroke-width: 1.2; }
-    .timeline-bubble.bubble-breach { fill: #111; fill-opacity: 0.18; stroke-width: 1.7; }
+    .timeline-bubble { fill: #fff; fill-opacity: 0.92; stroke: #111; stroke-width: 1.1; }
+    .timeline-bubble.bubble-breach { fill: #111; fill-opacity: 0.16; stroke-width: 1.6; }
     .chart-legend { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 4px 0 12px; font-size: 12px; }
     .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
     .legend-bubble { display: inline-block; border: 1px solid #111; border-radius: 50%; background: #fff; flex: 0 0 auto; }
@@ -1334,7 +1361,7 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
       .panel { border: 1px solid #cbd5e1; border-radius: 4px; padding: 8px; margin: 0 0 8px; break-inside: avoid; page-break-inside: avoid; overflow: visible; }
       .panel.table-panel { break-inside: auto; page-break-inside: auto; }
       .chart-wrap { overflow: visible; break-inside: avoid; page-break-inside: avoid; }
-      .timeline-chart { min-width: 0; }
+      .timeline-chart { min-width: 0 !important; }
       .chart-label { font-size: 8px; }
       .axis-title { font-size: 9px; }
       .x-label { font-size: 7px; }
