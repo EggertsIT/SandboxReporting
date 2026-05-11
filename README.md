@@ -31,14 +31,11 @@ The script writes three files in the current directory:
 - Destination domains are derived from the WEB `URL` host and reported in top-25
   tables for worst sandbox release time, worst average sandbox release time, and
   highest block ratio.
-- Timeline findings are grouped by UTC hour and include a compact static inline
-  SVG bubble chart in the HTML report. Each bubble is one UTC hour: x-axis is
-  time, y-axis is average sandbox release time on a log scale, and bubble size
-  is sandboxed file volume. The chart uses wider scrollable timelines for
-  longer ranges, smaller capped bubbles, and vertical day grid lines for
-  readability. Multi-day charts label each UTC day at 00:00 with vertical day
-  labels, and bubble hover titles include P90, worst release, and operational
-  counts.
+- Timeline findings are grouped by UTC hour and include a clean thin-line
+  static inline SVG chart in the HTML report for avg release and P90 release on
+  a log-scaled release-time axis. Multi-day charts label each UTC day at 00:00
+  with vertical day labels, and duration-axis ticks use human-friendly time
+  ceilings instead of powers of ten.
   The text summary keeps only the compact timeline findings.
 - Block ratio is based on WEB policy action and blocked-policy fields. Repeated
   WEB events for the same MD5 count as one file, but any blocked event marks

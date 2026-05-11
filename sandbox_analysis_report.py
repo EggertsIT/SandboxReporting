@@ -896,22 +896,10 @@ def timeline_axis_bounds(stats_rows: list[dict[str, object]]) -> tuple[datetime,
         axis_start = data_start.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         axis_start = data_start
-    axis_end = data_end + timedelta(hours=1)
+    axis_end = data_end
     if axis_end <= axis_start:
         axis_end = axis_start + timedelta(hours=1)
     return axis_start, axis_end
-
-
-def timeline_chart_dimensions(axis_start: datetime, axis_end: datetime, multi_day: bool) -> tuple[int, int, int, int, int, int]:
-    left = 82
-    top = 38
-    bottom = 278
-    span_hours = max(1.0, (axis_end - axis_start).total_seconds() / 3600)
-    plot_width = int(max(900, min(4200, span_hours * 12)))
-    right = left + plot_width
-    width = right + 120
-    height = bottom + (116 if multi_day else 78)
-    return width, left, right, top, bottom, height
 
 
 def timeline_x(timestamp: datetime, axis_start: datetime, axis_end: datetime, left: int, right: int) -> float:
@@ -920,48 +908,40 @@ def timeline_x(timestamp: datetime, axis_start: datetime, axis_end: datetime, le
     return left + ((right - left) * (offset_seconds / span_seconds))
 
 
-def timeline_y(value: float, min_exp: float, max_exp: float, top: int, bottom: int) -> float:
-    numeric_value = max(float(value), 1.0)
-    log_value = math.log10(numeric_value)
-    return bottom - (((log_value - min_exp) / (max_exp - min_exp)) * (bottom - top))
-
-
-def timeline_bubble_rows(stats_rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    return [
-        row
-        for row in stats_rows
-        if isinstance(row.get("hour"), datetime)
-        and isinstance(row.get("avg_release"), (float, int))
-        and int(row.get("sandboxed") or 0) > 0
-    ]
-
-
-def bubble_radius(count: int, max_count: int) -> float:
-    if max_count <= 1:
-        return 5.5
-    scaled = math.sqrt(max(count, 1)) / math.sqrt(max_count)
-    return 4.0 + (scaled * 8.0)
-
-
-def render_timeline_reference_lines(min_exp: float, max_exp: float, left: int, right: int, top: int, bottom: int) -> str:
-    if max_exp <= min_exp:
-        return ""
-
-    axis_top = 10**max_exp
-    output: list[str] = []
-    for value, label in ((300.0, "5m"), (float(SLA_BREACH_SECONDS), "10m SLA")):
-        if value > axis_top * 1.000001:
+def svg_log_points(
+    stats_rows: list[dict[str, object]],
+    key: str,
+    min_exp: float,
+    max_exp: float,
+    axis_start: datetime,
+    axis_end: datetime,
+    left: int,
+    right: int,
+    top: int,
+    bottom: int,
+) -> list[tuple[float, float]]:
+    if len(stats_rows) < 2 or max_exp <= min_exp:
+        return []
+    span_y = bottom - top
+    points: list[tuple[float, float]] = []
+    for row in stats_rows:
+        value = row.get(key)
+        timestamp = row.get("hour")
+        if not isinstance(value, (float, int)) or not isinstance(timestamp, datetime):
             continue
-        y = timeline_y(value, min_exp, max_exp, top, bottom)
-        output.append(
-            f'<line class="reference-line" x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}"></line>'
-            f'<text class="chart-label reference-label" x="{right + 8}" y="{y + 4:.1f}" text-anchor="start">{escape_html(label)}</text>'
-        )
-    return "".join(output)
+        numeric_value = max(float(value), 1.0)
+        log_value = math.log10(numeric_value)
+        x = timeline_x(timestamp, axis_start, axis_end, left, right)
+        y = bottom - (((log_value - min_exp) / (max_exp - min_exp)) * span_y)
+        points.append((x, y))
+    return points
 
 
-def render_timeline_bubbles(
-    bubble_rows: list[dict[str, object]],
+def render_timeline_markers(
+    stats_rows: list[dict[str, object]],
+    key: str,
+    css_class: str,
+    series_label: str,
     min_exp: float,
     max_exp: float,
     axis_start: datetime,
@@ -971,43 +951,61 @@ def render_timeline_bubbles(
     top: int,
     bottom: int,
 ) -> str:
-    max_count = max((int(row.get("sandboxed") or 0) for row in bubble_rows), default=1)
+    if max_exp <= min_exp:
+        return ""
+
+    valid_rows = [
+        row
+        for row in stats_rows
+        if isinstance(row.get(key), (float, int)) and isinstance(row.get("hour"), datetime)
+    ]
+    if len(valid_rows) != 1:
+        return ""
+
     output: list[str] = []
-    for row in bubble_rows:
+    span_y = bottom - top
+    for row in valid_rows:
+        value = row.get(key)
         timestamp = row.get("hour")
-        avg_release = row.get("avg_release")
-        if not isinstance(timestamp, datetime) or not isinstance(avg_release, (float, int)):
+        if not isinstance(value, (float, int)) or not isinstance(timestamp, datetime):
             continue
-        sandboxed = int(row.get("sandboxed") or 0)
-        sla_breaches = int(row.get("sla_breaches") or 0)
-        css_class = "timeline-bubble bubble-breach" if sla_breaches else "timeline-bubble"
-        x = timeline_x(timestamp + timedelta(minutes=30), axis_start, axis_end, left, right)
-        y = timeline_y(float(avg_release), min_exp, max_exp, top, bottom)
-        radius = bubble_radius(sandboxed, max_count)
-        title = (
-            f"{row.get('hour_label')}: "
-            f"sandboxed={sandboxed}, "
-            f"avg={format_seconds(avg_release)}, "
-            f"P90={format_seconds(row.get('p90_release') if isinstance(row.get('p90_release'), (float, int)) else None)}, "
-            f"worst={format_seconds(row.get('worst_release') if isinstance(row.get('worst_release'), (float, int)) else None)}, "
-            f"SLA breaches={sla_breaches}, "
-            f"known_by_cloud={int(row.get('known_by_cloud') or 0)}, "
-            f"canceled={int(row.get('canceled_or_incomplete') or 0)}, "
-            f"repeated_SFA={int(row.get('repeated_sfa') or 0)}"
-        )
-        output.append(f'<circle class="{css_class}" cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}"><title>{escape_html(title)}</title></circle>')
+        numeric_value = max(float(value), 1.0)
+        log_value = math.log10(numeric_value)
+        x = timeline_x(timestamp, axis_start, axis_end, left, right)
+        y = bottom - (((log_value - min_exp) / (max_exp - min_exp)) * span_y)
+        title = f'{series_label} {timestamp.strftime("%Y-%m-%d %H:00 UTC")}: {format_seconds(numeric_value)}'
+        output.append(f'<circle class="{css_class}" cx="{x:.1f}" cy="{y:.1f}" r="2.8"><title>{escape_html(title)}</title></circle>')
     return "".join(output)
 
 
-def render_timeline_x_ticks(
-    stats_rows: list[dict[str, object]],
-    axis_start: datetime,
-    axis_end: datetime,
-    left: int,
-    right: int,
-    top: int,
-    bottom: int,
-) -> str:
+def svg_path(points: list[tuple[float, float]]) -> str:
+    if not points:
+        return ""
+    first_x, first_y = points[0]
+    commands = [f"M {first_x:.1f} {first_y:.1f}"]
+    commands.extend(f"L {x:.1f} {y:.1f}" for x, y in points[1:])
+    return " ".join(commands)
+
+
+def smooth_svg_path(points: list[tuple[float, float]]) -> str:
+    if len(points) < 3:
+        return svg_path(points)
+
+    commands = [f"M {points[0][0]:.1f} {points[0][1]:.1f}"]
+    for index in range(len(points) - 1):
+        p0 = points[index - 1] if index > 0 else points[index]
+        p1 = points[index]
+        p2 = points[index + 1]
+        p3 = points[index + 2] if index + 2 < len(points) else p2
+        c1x = p1[0] + (p2[0] - p0[0]) / 6
+        c1y = p1[1] + (p2[1] - p0[1]) / 6
+        c2x = p2[0] - (p3[0] - p1[0]) / 6
+        c2y = p2[1] - (p3[1] - p1[1]) / 6
+        commands.append(f"C {c1x:.1f} {c1y:.1f}, {c2x:.1f} {c2y:.1f}, {p2[0]:.1f} {p2[1]:.1f}")
+    return " ".join(commands)
+
+
+def render_timeline_x_ticks(stats_rows: list[dict[str, object]], axis_start: datetime, axis_end: datetime, left: int, right: int, bottom: int) -> str:
     if not stats_rows:
         return ""
 
@@ -1023,18 +1021,9 @@ def render_timeline_x_ticks(
             ticks.append((current, current.strftime("%m-%d 00:00")))
             current += timedelta(days=1)
     else:
-        span_hours = max(1.0, (axis_end - axis_start).total_seconds() / 3600)
-        if span_hours <= 6:
-            ticks.append((min(hours), min(hours).strftime("%m-%d %H:%M")))
-            if max(hours) != min(hours):
-                ticks.append((max(hours), max(hours).strftime("%m-%d %H:%M")))
-        else:
-            step_hours = 2 if span_hours <= 12 else 4
-            current = axis_start.replace(minute=0, second=0, microsecond=0)
-            while current <= axis_end:
-                if current >= axis_start:
-                    ticks.append((current, current.strftime("%m-%d %H:%M")))
-                current += timedelta(hours=step_hours)
+        ticks.append((min(hours), min(hours).strftime("%m-%d %H:%M")))
+        if max(hours) != min(hours):
+            ticks.append((max(hours), max(hours).strftime("%m-%d %H:%M")))
 
     output: list[str] = []
     seen_labels: set[str] = set()
@@ -1043,8 +1032,6 @@ def render_timeline_x_ticks(
             continue
         seen_labels.add(label)
         x = timeline_x(timestamp, axis_start, axis_end, left, right)
-        if multi_day:
-            output.append(f'<line class="chart-day-grid" x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{bottom}"></line>')
         output.append(f'<line class="chart-tick" x1="{x:.1f}" y1="{bottom}" x2="{x:.1f}" y2="{bottom + 5}"></line>')
         if multi_day:
             label_y = bottom + 10
@@ -1060,57 +1047,64 @@ def render_timeline_x_ticks(
 
 
 def render_timeline_svg(stats_rows: list[dict[str, object]]) -> str:
-    bubble_rows = timeline_bubble_rows(stats_rows)
-    if not bubble_rows:
-        return '<p class="empty">No sandbox release durations for timeline bubble chart</p>'
+    if len(stats_rows) < 2:
+        return '<p class="empty">Not enough hourly data for timeline chart</p>'
 
-    hours = [row.get("hour") for row in bubble_rows if isinstance(row.get("hour"), datetime)]
+    width = 1040
+    left = 76
+    right = 952
+    top = 30
+    bottom = 188
+    hours = [row.get("hour") for row in stats_rows if isinstance(row.get("hour"), datetime)]
     multi_day = bool(hours and min(hours).date() != max(hours).date())
+    height = 300 if multi_day else 250
     duration_values = [
         float(row.get(key) or 0)
-        for row in bubble_rows
-        for key in ("avg_release", "p90_release", "worst_release")
+        for row in stats_rows
+        for key in ("avg_release", "p90_release")
         if isinstance(row.get(key), (float, int))
     ]
+    if not duration_values:
+        return '<p class="empty">No sandbox release durations for timeline chart</p>'
     min_exp, max_exp = log_chart_bounds(duration_values)
-    axis_start, axis_end = timeline_axis_bounds(bubble_rows)
-    width, left, right, top, bottom, height = timeline_chart_dimensions(axis_start, axis_end, multi_day)
+    axis_start, axis_end = timeline_axis_bounds(stats_rows)
+    avg_points = svg_log_points(stats_rows, "avg_release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
+    p90_points = svg_log_points(stats_rows, "p90_release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
 
     duration_ticks = log_tick_values(min_exp, max_exp)
     grid_lines = []
     for value in duration_ticks:
-        y = timeline_y(value, min_exp, max_exp, top, bottom)
+        tick_exp = math.log10(max(value, 1.0))
+        y = bottom - (((tick_exp - min_exp) / (max_exp - min_exp)) * (bottom - top))
         grid_lines.append(
             f'<line class="chart-grid" x1="{left}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}"></line>'
             f'<text class="chart-label axis-label" x="{left - 10}" y="{y + 4:.1f}" text-anchor="end">{escape_html(format_seconds(value))}</text>'
         )
 
-    x_ticks = render_timeline_x_ticks(bubble_rows, axis_start, axis_end, left, right, top, bottom)
-    reference_lines = render_timeline_reference_lines(min_exp, max_exp, left, right, top, bottom)
-    bubbles = render_timeline_bubbles(bubble_rows, min_exp, max_exp, axis_start, axis_end, left, right, top, bottom)
-    max_count = max((int(row.get("sandboxed") or 0) for row in bubble_rows), default=1)
-    large_radius = bubble_radius(max_count, max_count)
-    volume_legend = '<span><i class="legend-bubble small"></i>1 sandboxed file</span>'
-    if max_count > 1:
-        volume_legend += (
-            f'<span><i class="legend-bubble large" style="width:{large_radius * 2:.1f}px;height:{large_radius * 2:.1f}px;"></i>'
-            f'{escape_html(format_file_count(max_count))}</span>'
-        )
+    x_ticks = render_timeline_x_ticks(stats_rows, axis_start, axis_end, left, right, bottom)
+
+    avg_markers = render_timeline_markers(
+        stats_rows, "avg_release", "avg-point", "Avg release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom
+    )
+    p90_markers = render_timeline_markers(
+        stats_rows, "p90_release", "p90-point", "P90 release", min_exp, max_exp, axis_start, axis_end, left, right, top, bottom
+    )
     return f"""
 <div class="chart-wrap">
-  <svg class="timeline-chart" style="min-width:{width}px" viewBox="0 0 {width} {height}" role="img" aria-label="Timeline bubble chart showing average sandbox release time by UTC hour; bubble size shows sandboxed file volume">
+  <svg class="timeline-chart" viewBox="0 0 {width} {height}" role="img" aria-label="Timeline chart showing average release and P90 release by hour on a log scale">
     <rect class="chart-frame" x="{left}" y="{top}" width="{right - left}" height="{bottom - top}"></rect>
     {''.join(grid_lines)}
-    {reference_lines}
-    <text class="chart-label axis-title" x="{left}" y="18">Avg release time, log scale</text>
-    {bubbles}
+    <text class="chart-label axis-title" x="{left}" y="18">Release time, log scale</text>
+    <path class="avg-line" d="{escape_html(smooth_svg_path(avg_points))}"></path>
+    <path class="p90-line" d="{escape_html(smooth_svg_path(p90_points))}"></path>
+    {avg_markers}
+    {p90_markers}
     {x_ticks}
   </svg>
   <div class="chart-legend">
-    {volume_legend}
-    <span><i class="legend-bubble breach"></i>SLA breach hour</span>
+    <span><i class="legend-swatch avg"></i>Avg release</span>
+    <span><i class="legend-swatch p90"></i>P90 release</span>
   </div>
-  <p class="chart-note">Bubble size = sandboxed files in the UTC hour. Position = average sandbox release time.</p>
 </div>
 """
 
@@ -1327,22 +1321,20 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
     .timeline-chart { display: block; width: 100%; min-width: 720px; height: auto; }
     .chart-frame { fill: #fff; stroke: #111; stroke-width: 1.2; }
     .chart-grid { stroke: #d8d8d8; stroke-width: 1; }
-    .chart-day-grid { stroke: #eeeeee; stroke-width: 1; }
     .chart-tick { stroke: #111; stroke-width: 1; }
     .chart-label { fill: #111; font-family: "Courier New", Courier, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
     .axis-title { font-size: 12px; font-weight: 700; }
     .x-label { font-size: 10px; }
     .x-label-vertical { font-size: 9px; }
-    .reference-line { stroke: #777; stroke-width: 1; stroke-dasharray: 3 4; }
-    .reference-label { fill: #333; font-size: 9px; }
-    .timeline-bubble { fill: #fff; fill-opacity: 0.92; stroke: #111; stroke-width: 1.1; }
-    .timeline-bubble.bubble-breach { fill: #111; fill-opacity: 0.16; stroke-width: 1.6; }
+    .avg-line { fill: none; stroke: #555; stroke-width: 1; stroke-dasharray: 8 5; }
+    .p90-line { fill: none; stroke: #111; stroke-width: 1.15; }
+    .avg-point { fill: #fff; stroke: #555; stroke-width: 1; }
+    .p90-point { fill: #111; stroke: #111; stroke-width: 1; }
     .chart-legend { display: flex; flex-wrap: wrap; gap: 10px 18px; margin: 4px 0 12px; font-size: 12px; }
     .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
-    .legend-bubble { display: inline-block; border: 1px solid #111; border-radius: 50%; background: #fff; flex: 0 0 auto; }
-    .legend-bubble.small { width: 10px; height: 10px; }
-    .legend-bubble.breach { width: 12px; height: 12px; background: #d8d8d8; border-width: 2px; }
-    .chart-note { margin: 2px 0 0; color: #333; font-size: 12px; }
+    .legend-swatch { display: inline-block; width: 28px; height: 0; border-top: 2px solid #111; }
+    .legend-swatch.avg { border-color: #555; border-top-style: dashed; }
+    .legend-swatch.p90 { border-color: #111; }
     details summary { cursor: pointer; color: #111; font-weight: 700; margin-bottom: 12px; text-transform: uppercase; }
     pre { background: #f7f7f7; color: #111; border: 1px solid #111; padding: 14px; border-radius: 0; overflow: auto; font-size: 12px; line-height: 1.45; }
     @media (max-width: 820px) { .page { padding: 16px; } .grid { grid-template-columns: 1fr; } h1 { font-size: 24px; } }
@@ -1361,13 +1353,12 @@ def render_html_report(detail_rows: list[dict[str, str]], summary_text: str, web
       .panel { border: 1px solid #cbd5e1; border-radius: 4px; padding: 8px; margin: 0 0 8px; break-inside: avoid; page-break-inside: avoid; overflow: visible; }
       .panel.table-panel { break-inside: auto; page-break-inside: auto; }
       .chart-wrap { overflow: visible; break-inside: avoid; page-break-inside: avoid; }
-      .timeline-chart { min-width: 0 !important; }
+      .timeline-chart { min-width: 0; }
       .chart-label { font-size: 8px; }
       .axis-title { font-size: 9px; }
       .x-label { font-size: 7px; }
       .x-label-vertical { font-size: 6.5px; }
       .chart-legend { font-size: 8px; gap: 6px 12px; margin-bottom: 6px; }
-      .chart-note { font-size: 8px; margin-top: 0; }
       .table-wrap { overflow: visible; border: none !important; }
       table { table-layout: fixed; width: 100%; font-size: 8.5px; line-height: 1.2; }
       thead { display: table-header-group; }
